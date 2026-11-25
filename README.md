@@ -32,6 +32,76 @@ broker.acknowledge(batch["gpu-0"], now=105)
 
 `take_batch` 最多接受 24 个槽；`workers=None` 或 `{}` 表示本轮没有空闲槽。槽 ID 的命名规则与资源键相同，也区分大小写。槽 ID 只用于本轮返回结果，数据库不保存跨轮槽占用状态，确认仍以 `Delivery.receipt` 为准。
 
+## 归档分区变更流
+
+归档源事件可能跨分区重复、乱序到达或补传。不要在 `stage_event` 时直接调用 `put_ordered`；先把事件可靠暂存在 SQLite，等源给出时间水位和无缺号截点后，再由调度进程用 `publish_ready` 小批、全局有序地转入普通任务队列。
+
+```python
+broker.configure_feed(("A", "B"))          # 首次 True；同组任意顺序重登 False
+
+broker.stage_event(
+    "A", 2,                                # 分区内正整数 offset，可先传后面的号
+    event_time=6,                          # 业务时间轴上的非负 int，不是租约 now
+    key="asset-123",
+    needs=frozenset({"gpu"}),              # 或 None；None 与 frozenset() 同义
+    payload="archive-payload",             # 规则同 put_ordered
+)
+
+broker.seal_source("A", through=3, watermark=10)
+broker.seal_source("B", through=2, watermark=10)
+broker.source_checkpoints()
+# {"A": (3, 10), "B": (2, 10)}
+
+ready = broker.publish_ready(limit=16)
+# [("A", 2, job_id), ("B", 1, job_id), ...]
+```
+
+### 源登记与幂等暂存
+
+- `configure_feed(partitions)` 接收恰好一个元组，含 1–8 个互不相同的分区名；名称遵循资源键格式并区分大小写。每个数据库只能有一组源：首次登记返回 `True`，同一组名称以任意顺序重复登记返回 `False`；改成另一组或输入非法均抛 `ValueError`。源组运行期不增删。
+- 未成功登记源组时，`stage_event`、`seal_source`、`source_checkpoints` 和 `publish_ready` 都抛 `ValueError`；带分区名的入口也拒绝源组之外的名称。
+- 事件身份是 `(partition, offset)`。offset 是分区内从 1 开始的正整数；`offset`、`event_time` 都必须是不是 `bool` 的 SQLite 有符号 64 位整数，其中 `event_time >= 0`。`key`、`needs`、`payload` 的格式和上限与 `put_ordered` 完全相同。
+- `stage_event` 只写暂存表，不创建 `jobs` 行、不消耗任务 ID。
+  - `offset <= 当前 through`：只要参数本身合法，重传一律返回 `False`；不比较旧内容，也不会重建任务。即使该前缀的暂存数据已在发布后回收，也可仅凭截点幂等确认。
+  - `offset > 当前 through`：同身份且 `event_time/key/needs/payload` 内容相同返回 `False`；同身份异内容抛 `ValueError`；新事件成功写入返回 `True`。`needs=None` 与 `needs=frozenset()` 视为相同内容。
+  - 新 offset 最多为 `当前 through + 12_000`；新事件的 `event_time` 必须严格大于分区当前水位，否则抛 `ValueError`。
+
+### 截点、水位与背压
+
+`source_checkpoints()` 返回 `{partition: (through, watermark)}`；登记后、首次封存前均为 `(0, -1)`。
+
+`seal_source(partition, *, through, watermark)` 的两个值都必须是不是 `bool` 的非负 SQLite 有符号 64 位整数：
+
+- `through`、`watermark` 均不得倒退；新 `through <= 当前 through + 12_000`。
+- `(through, watermark)` 与当前截点完全相同时，是幂等重传，返回 `False`；through 或 watermark 任一合法前进均返回 `True`。
+- 推进 through 时，`(旧 through, 新 through]` 内每个 offset 都必须已暂存，不能缺号；这些消息的 `event_time` 必须 `<= 新 watermark`。
+- 所有已暂存且 `offset > 新 through` 的消息，`event_time` 必须严格 `> 新 watermark`。
+- through 不变时也可以只提高 watermark，用来证明该分区这段时间没有新事件；不需要为了推进水位而伪造 offset 或心跳事件。尚未有事件的新分区可用 `seal_source(name, through=0, watermark=...)` 把初始 `-1` 水位提升到非负值。
+- 缺号、参数非法或事件时间与水位承诺矛盾时抛 `ValueError`，截点和暂存内容整体回滚。
+- 每个分区至多有一段已封但尚未全部转入 `jobs` 的前缀，以及至多 12,000 个 offset 宽度的未封消息。若上一段已封消息仍有暂存行，合法请求也不能推进 through，应抛内置 `BufferError`；但 through 不变、只提升 watermark 仍允许。这个背压只看“是否已经写入正式任务表并删除暂存行”，与 worker 是否可领取、是否持有租约或是否已经 ack 无关。
+- 已发布事件的暂存行会在同一事务中删除；之后重传靠 through 识别，不保留无限增长的逐事件历史。
+
+### 全局有序发布
+
+调用方（通常是调度进程）应反复调用小批量：
+
+```python
+published = broker.publish_ready(limit=64)
+# published: [(partition, offset, job_id), ...]，与正式 job ID 升序同序
+```
+
+- `limit` 必须是不是 `bool` 的整数，且 `1 <= limit <= 128`，否则抛 `ValueError`。
+- 安全时间是**所有分区当前 watermark 的最小值**；暂时没有事件的分区也参与，因此任一分区仍为初始 `-1` 时不会发布任何事件。
+- 候选事件必须已经封存、暂存行仍在（即尚未入队），且 `event_time <= safe_time`。
+- 本批按 `(event_time, partition 的 ASCII/二进制字典序, offset)` 全局排序，取最早的至多 `limit` 条。同一时刻先按分区名排序；同一分区同一时刻再由 offset 决胜。不会按分区各切一批，也不会让同一分区的旧 offset 阻塞事件时刻更早的消息。
+- 返回列表顺序就是上述全局顺序，也是本批正式 job ID 的递增分配顺序。
+
+`publish_ready` 在一个 `BEGIN IMMEDIATE` 事务中完成安全时间计算、索引选择、正式 `jobs` 写入和对应暂存行删除：全部成功或全部回滚。多个 `Broker` 实例/进程并发调用同一 SQLite 文件时，写锁使各批串行提交，因此同一条暂存消息不会重复入队，一批内的 job ID 也不会被其他写入打乱。已提交响应丢失后直接再次调用即可：上一批的暂存行已删除，后续调用从下一条开始，不会补发同一任务。
+
+发布出的行与 `put_ordered` 写入的任务完全同构，共用原 job ID 序列、能力掩码、资源键 FIFO、`Delivery`、租约、确认和到期重领。它们没有 `graph_nodes`、依赖或 sink 记录，因此不会产生工作流结论；普通任务、原有工作流和接收方行为保持不变。归档发布只保证已发布归档任务彼此按上述顺序获得 ID：发布前不会插到已有普通任务之前，两次 `publish_ready` 之间仍允许原入口写入新任务。
+
+就绪选择使用 `sealed = 1` 部分索引 `(event_time, partition, source_offset)`，并用 `LIMIT` 提前终止；查询不会为了找到极短的就绪前缀而扫描、排序或装载整个未来积压，payload 也只读取本批中签的行。
+
 ## 工作流依赖图
 
 使用 `submit_graph(workflow_id, nodes)` 在同一个 SQLite 事务内提交整组节点。`workflow_id`、节点 `name` 和节点 `key` 都使用上述 1–64 字符命名规则；同一工作流内节点名不能重复，工作流名一旦使用便不能再次提交（即使所有节点都已结束）。
@@ -172,8 +242,9 @@ broker.ack_outcomes("index", through=outcomes[-1]["seq"])  # True
 - 新入口 payload 必须是字符串或 `None`，UTF-8 编码后不超过 16 KiB。
 - `now`、`lease` 必须是整数且不能是 `bool`；`now >= 0`、`lease > 0`、`now + lease <= 2**63 - 1`。
 - `sinks` 必须是元组，元素为已登记名称；`capacity`、`limit`、`through` 的取值规则见上面的结论投递一节。
+- 归档源的 `partitions` 必须是含 1–8 个不同合法名称的元组；归档 `offset` 为正 int64，`event_time`、封存 `through`/`watermark` 为非负 int64，均不能是 `bool`。`publish_ready(limit=...)` 的 `limit` 为 1–128；新 offset 相对当前 through 的超前宽度、以及单次 through 推进宽度均不得超过 12,000。
 
-现有数据库可直接由新版 `Broker(path)` 打开。初始化会在事务内补齐 `resource_key`、`needs_mask` 列，并额外创建 `graph_workflows`、`graph_nodes`、`graph_dependencies` 表；若旧表的 `payload TEXT NOT NULL` 阻碍空 payload，会重建 `jobs` 表并原样复制 ID、payload、receipt、expires，同时保留 AUTOINCREMENT 序列高水位和早期库中的非整数到期值。结论投递相关表（`sink_registry`、`sink_watermark`、`graph_node_sinks`、`outcome_stream`、`outcome_deliveries`）以 `IF NOT EXISTS` 补齐；旧版 `graph_nodes` 会新增 `outcomes` 列并以 `DEFAULT 1` 标记既有节点，因此升级不会补发旧终态结论、也不改写活跃租约。不需要清空或另建队列。
+现有数据库可直接由新版 `Broker(path)` 打开。初始化会在事务内补齐 `resource_key`、`needs_mask` 列，并额外创建 `graph_workflows`、`graph_nodes`、`graph_dependencies` 表；若旧表的 `payload TEXT NOT NULL` 阻碍空 payload，会重建 `jobs` 表并原样复制 ID、payload、receipt、expires，同时保留 AUTOINCREMENT 序列高水位和早期库中的非整数到期值。归档源功能额外幂等创建 `archive_feed_sources`、`archive_events` 及就绪顺序部分索引，不改变或迁移任何旧任务。结论投递相关表（`sink_registry`、`sink_watermark`、`graph_node_sinks`、`outcome_stream`、`outcome_deliveries`）以 `IF NOT EXISTS` 补齐；旧版 `graph_nodes` 会新增 `outcomes` 列并以 `DEFAULT 1` 标记既有节点，因此升级不会补发旧终态结论、也不改写活跃租约。不需要清空或另建队列。
 
 ## 本地测试与演示
 
@@ -199,6 +270,13 @@ python3 -B demo.py
 - 失败结论顺序、级联跳过的结论、失败不传播 `after`、多接收方相同序号、按提交顺序而非任务 ID 排序；
 - 确认边界校验（跨接收方/未来序号拒绝）、按实际条数释放、并发重复确认、确认后流存储回收；
 - 旧图库升级后不补发旧结论、原凭据与原依赖继续工作；
-- 12,000 节点、32 接收方、失败触发全量跳过时的分页读取与 `tracemalloc` 内存上限，以及只发给乙的结论在大量甲流之后的低成本单页读取。
+- 12,000 节点、32 接收方、失败触发全量跳过时的分页读取与 `tracemalloc` 内存上限，以及只发给乙的结论在大量甲流之后的低成本单页读取；
+- 归档源登记幂等/改组拒绝、未登记分区拒绝、参数和 int64/布尔校验；
+- 归档事件乱序暂存、未封重传/冲突、封内不比较重传、缺号和水位矛盾、重开恢复；
+- 全分区最小水位、`(event_time, ASCII 分区名, offset)` 全局排序、同分区同时刻 offset 决胜；
+- 已封前缀未全部发布时的 `BufferError`、只提升水位、worker 租约/确认与封存背压解耦、暂存回收；
+- 两个独立 `Broker` 实例并发发布时无重复、无遗漏且 job ID/全局顺序一致；
+- 归档任务沿用资源键 FIFO、GPU 能力阻塞、旧凭据/到期重领，并与同键工作流和 sink 结论共存；
+- 8 分区、84,000 条积压（含 1,024 条 16 KiB payload）下，重开后三次 `limit=1` 发布只命中时刻 0、时刻 10 和空列表；每次调用的 `tracemalloc` 峰值增量不超过 6 MiB，每 1,000 条 VM 指令采样的 progress handler 回调不超过 150 次。
 
 演示依次显示任务领取、重投、`stale ack: False`、`current ack: True` 和 `empty: True`。

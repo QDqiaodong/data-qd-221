@@ -27,6 +27,9 @@ MAX_GRAPH_DEPENDENCIES = 48_000
 MAX_SINKS = 32
 MAX_SINK_CAPACITY = 12_000
 MAX_OUTCOME_LIMIT = 128
+MAX_FEED_PARTITIONS = 8
+MAX_FEED_PENDING = 12_000
+MAX_PUBLISH_LIMIT = 128
 
 CAPABILITIES = (
     "gpu",
@@ -132,6 +135,24 @@ def _validate_capacity(capacity):
     return capacity
 
 
+def _validate_positive_int64(value, kind):
+    if not _is_integer(value) or value < 1 or value > _MAX_SQLITE_INTEGER:
+        raise ValueError(
+            f"{kind} must be a positive SQLite signed 64-bit integer; "
+            "booleans are not allowed"
+        )
+    return value
+
+
+def _validate_non_negative_int64(value, kind):
+    if not _is_integer(value) or value < 0 or value > _MAX_SQLITE_INTEGER:
+        raise ValueError(
+            f"{kind} must be a non-negative SQLite signed 64-bit integer; "
+            "booleans are not allowed"
+        )
+    return value
+
+
 def _normalize_sinks(sinks):
     """Return a de-duplicated tuple of registered sink names.
 
@@ -204,6 +225,7 @@ class Broker:
             self._create_graph_schema(db)
             self._migrate_graph_nodes(db)
             self._create_sink_schema(db)
+            self._create_feed_schema(db)
             db.commit()
 
     @staticmethod
@@ -310,6 +332,48 @@ class Broker:
         )
 
     @staticmethod
+    def _create_feed_schema(db):
+        # One row per configured archive partition.  ``position`` preserves the
+        # registration tuple order for diagnostics; scheduling order is always
+        # the ASCII partition-name tie-break defined by publish_ready().
+        db.execute(
+            """CREATE TABLE IF NOT EXISTS archive_feed_sources (
+                partition TEXT PRIMARY KEY,
+                position INTEGER NOT NULL UNIQUE,
+                through_offset INTEGER NOT NULL DEFAULT 0
+                    CHECK (through_offset >= 0),
+                watermark INTEGER NOT NULL DEFAULT -1
+                    CHECK (watermark >= -1)
+            )"""
+        )
+        # Rows are retained only until their sealed prefix is published into
+        # jobs.  The primary key gives idempotent identity lookup; the partial
+        # index lets publish_ready seek the global ready frontier without
+        # scanning unsealed or future events.
+        db.execute(
+            """CREATE TABLE IF NOT EXISTS archive_events (
+                partition TEXT NOT NULL,
+                source_offset INTEGER NOT NULL
+                    CHECK (source_offset > 0),
+                event_time INTEGER NOT NULL
+                    CHECK (event_time >= 0),
+                resource_key TEXT NOT NULL,
+                needs_mask INTEGER NOT NULL DEFAULT 0,
+                payload TEXT,
+                sealed INTEGER NOT NULL DEFAULT 0
+                    CHECK (sealed IN (0, 1)),
+                PRIMARY KEY (partition, source_offset)
+            )"""
+        )
+        db.execute(
+            """CREATE INDEX IF NOT EXISTS idx_archive_events_ready
+                ON archive_events(
+                    event_time, partition, source_offset
+                )
+                WHERE sealed = 1"""
+        )
+
+    @staticmethod
     def _migrate_graph_nodes(db):
         """Add the outcome marker to graph tables created by older versions.
 
@@ -410,6 +474,348 @@ class Broker:
                 (payload, key, needs_mask),
             ).lastrowid
             return int(job_id)
+
+    def configure_feed(self, partitions):
+        """Register the single static archive partition group for this database."""
+        if not isinstance(partitions, tuple):
+            raise ValueError(
+                "partitions must be a tuple containing 1 to 8 distinct names"
+            )
+        if not 1 <= len(partitions) <= MAX_FEED_PARTITIONS:
+            raise ValueError(
+                f"partitions must contain 1 to {MAX_FEED_PARTITIONS} names"
+            )
+
+        seen = set()
+        normalized = []
+        for position, name in enumerate(partitions):
+            _validate_name(name, "partition name")
+            if name in seen:
+                raise ValueError(f"partition name {name!r} is duplicated")
+            seen.add(name)
+            normalized.append((name, position))
+
+        with closing(self._connect()) as db:
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                existing = [
+                    row[0]
+                    for row in db.execute(
+                        "SELECT partition FROM archive_feed_sources "
+                        "ORDER BY position"
+                    )
+                ]
+                if existing:
+                    if set(existing) != seen:
+                        raise ValueError(
+                            "this database already has a different archive "
+                            "partition group"
+                        )
+                    db.rollback()
+                    return False
+
+                db.executemany(
+                    "INSERT INTO archive_feed_sources"
+                    "(partition, position, through_offset, watermark) "
+                    "VALUES (?, ?, 0, -1)",
+                    normalized,
+                )
+                db.commit()
+            except BaseException:
+                db.rollback()
+                raise
+        return True
+
+    @staticmethod
+    def _require_feed_partition(db, partition):
+        row = db.execute(
+            "SELECT through_offset, watermark "
+            "FROM archive_feed_sources WHERE partition = ?",
+            (partition,),
+        ).fetchone()
+        if row is None:
+            configured = db.execute(
+                "SELECT 1 FROM archive_feed_sources LIMIT 1"
+            ).fetchone()
+            if configured is None:
+                raise ValueError("archive feed partitions have not been configured")
+            raise ValueError(
+                f"partition {partition!r} is not in the configured archive feed"
+            )
+        return int(row[0]), int(row[1])
+
+    def source_checkpoints(self):
+        """Return ``{partition: (through, watermark)}`` for the feed group."""
+        with closing(self._connect()) as db:
+            rows = db.execute(
+                "SELECT partition, through_offset, watermark "
+                "FROM archive_feed_sources ORDER BY position"
+            ).fetchall()
+        if not rows:
+            raise ValueError("archive feed partitions have not been configured")
+        return {
+            partition: (int(through), int(watermark))
+            for partition, through, watermark in rows
+        }
+
+    def stage_event(
+        self,
+        partition,
+        offset,
+        *,
+        event_time,
+        key,
+        needs,
+        payload,
+    ):
+        """Idempotently stage an archive event without creating a queue job."""
+        _validate_name(partition, "partition name")
+        _validate_positive_int64(offset, "offset")
+        _validate_non_negative_int64(event_time, "event_time")
+        _validate_name(key, "resource key")
+        needs_mask = _capability_mask(needs, nullable=True)
+        _validate_payload(payload)
+
+        with closing(self._connect()) as db:
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                through, watermark = self._require_feed_partition(db, partition)
+
+                # A checkpoint is the truncation promise.  Retries inside its
+                # prefix are acknowledged from that promise alone, even after
+                # the corresponding staging rows were published and removed.
+                if offset <= through:
+                    db.rollback()
+                    return False
+
+                existing = db.execute(
+                    "SELECT event_time, resource_key, needs_mask, payload "
+                    "FROM archive_events "
+                    "WHERE partition = ? AND source_offset = ?",
+                    (partition, offset),
+                ).fetchone()
+                if existing is not None:
+                    if tuple(existing) != (
+                        event_time,
+                        key,
+                        needs_mask,
+                        payload,
+                    ):
+                        raise ValueError(
+                            f"event identity ({partition!r}, {offset}) was "
+                            "already staged with different content"
+                        )
+                    db.rollback()
+                    return False
+
+                if offset > through + MAX_FEED_PENDING:
+                    raise ValueError(
+                        f"offset is more than {MAX_FEED_PENDING} beyond the "
+                        "partition's sealed offset"
+                    )
+                if event_time <= watermark:
+                    raise ValueError(
+                        "new event_time must be strictly greater than the "
+                        "partition's current watermark"
+                    )
+
+                db.execute(
+                    """INSERT INTO archive_events(
+                            partition, source_offset, event_time,
+                            resource_key, needs_mask, payload, sealed
+                        ) VALUES (?, ?, ?, ?, ?, ?, 0)""",
+                    (
+                        partition,
+                        offset,
+                        event_time,
+                        key,
+                        needs_mask,
+                        payload,
+                    ),
+                )
+                db.commit()
+            except BaseException:
+                db.rollback()
+                raise
+        return True
+
+    def seal_source(self, partition, *, through, watermark):
+        """Persist a source truncation/watermark checkpoint."""
+        _validate_name(partition, "partition name")
+        _validate_non_negative_int64(through, "through")
+        _validate_non_negative_int64(watermark, "watermark")
+
+        with closing(self._connect()) as db:
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                current_through, current_watermark = (
+                    self._require_feed_partition(db, partition)
+                )
+
+                if through < current_through or watermark < current_watermark:
+                    raise ValueError("source checkpoints cannot move backwards")
+                if through == current_through and watermark == current_watermark:
+                    db.rollback()
+                    return False
+                if through > current_through + MAX_FEED_PENDING:
+                    raise ValueError(
+                        f"through can advance by at most {MAX_FEED_PENDING}"
+                    )
+
+                if through > current_through:
+                    expected = through - current_through
+                    present, late = db.execute(
+                        """SELECT COUNT(*),
+                                  COALESCE(SUM(
+                                      CASE WHEN event_time > ? THEN 1 ELSE 0 END
+                                  ), 0)
+                             FROM archive_events
+                            WHERE partition = ?
+                              AND source_offset > ?
+                              AND source_offset <= ?""",
+                        (
+                            watermark,
+                            partition,
+                            current_through,
+                            through,
+                        ),
+                    ).fetchone()
+                    if int(present) != expected:
+                        raise ValueError(
+                            "sealed offset prefix is missing one or more events"
+                        )
+                    if int(late):
+                        raise ValueError(
+                            "one or more events in the sealed prefix are later "
+                            "than the proposed watermark"
+                        )
+
+                future_conflict = db.execute(
+                    """SELECT 1
+                         FROM archive_events
+                        WHERE partition = ?
+                          AND source_offset > ?
+                          AND event_time <= ?
+                        LIMIT 1""",
+                    (partition, through, watermark),
+                ).fetchone()
+                if future_conflict is not None:
+                    raise ValueError(
+                        "a staged event beyond through is not strictly after "
+                        "the proposed watermark"
+                    )
+
+                if through > current_through:
+                    unfinished = db.execute(
+                        """SELECT 1
+                             FROM archive_events
+                            WHERE partition = ? AND sealed = 1
+                            LIMIT 1""",
+                        (partition,),
+                    ).fetchone()
+                    if unfinished is not None:
+                        raise BufferError(
+                            "the previous sealed prefix has not all been "
+                            "published into jobs yet"
+                        )
+
+                db.execute(
+                    "UPDATE archive_feed_sources "
+                    "SET through_offset = ?, watermark = ? "
+                    "WHERE partition = ?",
+                    (through, watermark, partition),
+                )
+                if through > current_through:
+                    db.execute(
+                        """UPDATE archive_events
+                              SET sealed = 1
+                            WHERE partition = ?
+                              AND source_offset > ?
+                              AND source_offset <= ?""",
+                        (partition, current_through, through),
+                    )
+                db.commit()
+            except BaseException:
+                db.rollback()
+                raise
+        return True
+
+    def publish_ready(self, *, limit):
+        """Publish a small globally ordered batch of ready sealed events."""
+        if not _is_integer(limit) or isinstance(limit, bool):
+            raise ValueError(
+                "limit must be an integer; booleans are not allowed"
+            )
+        if not 1 <= limit <= MAX_PUBLISH_LIMIT:
+            raise ValueError(
+                f"limit must be between 1 and {MAX_PUBLISH_LIMIT}"
+            )
+
+        with closing(self._connect()) as db:
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                safe_time = db.execute(
+                    "SELECT MIN(watermark) FROM archive_feed_sources"
+                ).fetchone()[0]
+                if safe_time is None:
+                    raise ValueError(
+                        "archive feed partitions have not been configured"
+                    )
+
+                # This uses the partial index on sealed rows and stops after
+                # ``limit`` entries; payloads are fetched only for winners.
+                ready = db.execute(
+                    """SELECT rowid, partition, source_offset
+                         FROM archive_events
+                        WHERE sealed = 1
+                          AND event_time <= ?
+                        ORDER BY event_time ASC,
+                                 partition ASC,
+                                 source_offset ASC
+                        LIMIT ?""",
+                    (int(safe_time), limit),
+                ).fetchall()
+                if not ready:
+                    db.rollback()
+                    return []
+
+                rowids = [row[0] for row in ready]
+                placeholders = ",".join("?" for _ in rowids)
+                content_rows = db.execute(
+                    f"""SELECT rowid, resource_key, needs_mask, payload
+                          FROM archive_events
+                         WHERE rowid IN ({placeholders})""",
+                    rowids,
+                ).fetchall()
+                content_by_rowid = {
+                    row[0]: (row[1], int(row[2]), row[3])
+                    for row in content_rows
+                }
+
+                published = []
+                for rowid, partition, offset in ready:
+                    resource_key, needs_mask, payload = content_by_rowid[rowid]
+                    job_id = db.execute(
+                        "INSERT INTO jobs"
+                        "(payload, resource_key, needs_mask) "
+                        "VALUES (?, ?, ?)",
+                        (payload, resource_key, needs_mask),
+                    ).lastrowid
+                    deleted = db.execute(
+                        "DELETE FROM archive_events WHERE rowid = ?",
+                        (rowid,),
+                    )
+                    if deleted.rowcount != 1:
+                        raise sqlite3.OperationalError(
+                            "archive event selection no longer matched staging row"
+                        )
+                    published.append((partition, int(offset), int(job_id)))
+
+                db.commit()
+            except BaseException:
+                db.rollback()
+                raise
+        return published
 
     @staticmethod
     def _validate_reference_list(value, field):
