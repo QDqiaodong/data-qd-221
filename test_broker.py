@@ -1,12 +1,15 @@
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import os
 import sqlite3
+import subprocess
+import sys
 import threading
 import tracemalloc
 import unittest
 
-from broker import CAPABILITIES, Broker, Delivery
+from broker import CAPABILITIES, Broker, Delivery, MAX_GRAPH_NODES
 
 
 class BrokerTest(unittest.TestCase):
@@ -617,6 +620,746 @@ class MemoryAndScaleTest(unittest.TestCase):
                 sorted(delivery.id for delivery in second.values()),
                 list(range(25, 49)),
             )
+
+
+def graph_node(
+    name,
+    *,
+    key=None,
+    payload="payload",
+    needs=None,
+    requires=(),
+    after=(),
+):
+    return {
+        "name": name,
+        "key": key if key is not None else f"key-{name}",
+        "payload": payload,
+        "needs": needs,
+        "requires": list(requires),
+        "after": list(after),
+    }
+
+
+class SubmitGraphValidationTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self.path = Path(self._tmp.name, "graph-validation.db")
+        self.broker = Broker(self.path)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_forward_references_ids_and_atomic_workflow_reuse(self):
+        nodes = [
+            graph_node(
+                "publish",
+                key="asset",
+                requires=["transcode"],
+                after=["archive"],
+            ),
+            graph_node("transcode", key="media", needs=frozenset({"gpu"})),
+            graph_node("archive", key="archive"),
+        ]
+
+        ids = self.broker.submit_graph("release-2026", nodes)
+
+        self.assertEqual(list(ids), ["publish", "transcode", "archive"])
+        self.assertEqual(set(ids.values()), {1, 2, 3})
+        self.assertEqual(
+            self.broker.graph_status("release-2026"),
+            {
+                "publish": "pending",
+                "transcode": "pending",
+                "archive": "pending",
+            },
+        )
+
+        with self.assertRaises(ValueError):
+            self.broker.submit_graph("release-2026", nodes)
+
+    def test_same_key_forward_dependency_is_a_cycle_but_key_change_recovers(self):
+        nodes = [
+            graph_node("publish", key="same-key", requires=["transcode"]),
+            graph_node("transcode", key="same-key"),
+        ]
+
+        with self.assertRaises(ValueError):
+            self.broker.submit_graph("workflow", nodes)
+
+        with sqlite3.connect(self.path) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0], 0)
+            self.assertEqual(
+                db.execute(
+                    "SELECT COUNT(*) FROM graph_workflows "
+                    "WHERE workflow_id = 'workflow'"
+                ).fetchone()[0],
+                0,
+            )
+
+        nodes[0]["key"] = "publish-key"
+        ids = self.broker.submit_graph("workflow", nodes)
+        self.assertEqual(set(ids), {"publish", "transcode"})
+
+        # The name remains occupied after every node reaches a terminal state.
+        delivery = self.broker.take(now=0, lease=10)
+        self.assertEqual(delivery.id, ids["transcode"])
+        self.assertTrue(self.broker.acknowledge(delivery, now=1))
+        delivery = self.broker.take(now=1, lease=10)
+        self.assertEqual(delivery.id, ids["publish"])
+        self.assertTrue(self.broker.acknowledge(delivery, now=2))
+        with self.assertRaises(ValueError):
+            self.broker.submit_graph("workflow", nodes)
+
+    def test_invalid_graphs_and_cycles_have_no_partial_writes(self):
+        legacy_id = self.broker.put("legacy")
+
+        def snapshot():
+            with sqlite3.connect(self.path) as db:
+                return (
+                    db.execute(
+                        "SELECT id, payload, receipt, expires, resource_key, "
+                        "needs_mask FROM jobs ORDER BY id"
+                    ).fetchall(),
+                    db.execute(
+                        "SELECT workflow_id FROM graph_workflows ORDER BY rowid"
+                    ).fetchall(),
+                    db.execute(
+                        "SELECT job_id, workflow_id, name, status "
+                        "FROM graph_nodes ORDER BY job_id"
+                    ).fetchall(),
+                    db.execute(
+                        "SELECT node_id, prerequisite_id, kind "
+                        "FROM graph_dependencies ORDER BY rowid"
+                    ).fetchall(),
+                )
+
+        before = snapshot()
+        self.assertEqual(before[0], [(legacy_id, "legacy", None, 0, None, 0)])
+
+        invalid_graphs = [
+            lambda: [],
+            lambda: None,
+            lambda: [graph_node("ok")] * (MAX_GRAPH_NODES + 1),
+            lambda: ["not-a-dict"],
+            lambda: [graph_node("bad name")],
+            lambda: [graph_node("dup"), graph_node("dup")],
+            lambda: [graph_node("n", key="bad key")],
+            lambda: [graph_node("n", payload=b"bytes")],
+            lambda: [graph_node("n", payload="x" * (16 * 1024 + 1))],
+            lambda: [graph_node("n", needs=["gpu"])],
+            lambda: [graph_node("n", needs=frozenset({"bogus"}))],
+            lambda: [graph_node("n", requires="transcode")],
+            lambda: [graph_node("n", requires=["bad name"])],
+            lambda: [
+                graph_node("n", requires=["a", "a"]),
+                graph_node("a"),
+            ],
+            lambda: [
+                graph_node("n", requires=["a"], after=["a"]),
+                graph_node("a"),
+            ],
+            lambda: [graph_node("n", requires=["missing"])],
+            lambda: [graph_node("n", requires=["n"])],
+            lambda: [
+                graph_node("a", key="ka", requires=["b"]),
+                graph_node("b", key="kb", after=["a"]),
+            ],
+            lambda: [
+                graph_node("publish", key="same", requires=["transcode"]),
+                graph_node("transcode", key="same"),
+            ],
+        ]
+
+        for index, make_nodes in enumerate(invalid_graphs):
+            with self.subTest(index=index):
+                with self.assertRaises(ValueError):
+                    self.broker.submit_graph(f"invalid-{index}", make_nodes())
+                self.assertEqual(snapshot(), before)
+
+    def test_used_workflow_rejection_does_not_write_second_group(self):
+        nodes = [graph_node("only")]
+        self.broker.submit_graph("once", nodes)
+        with sqlite3.connect(self.path) as db:
+            before_jobs = db.execute("SELECT * FROM jobs ORDER BY id").fetchall()
+            before_deps = db.execute(
+                "SELECT * FROM graph_dependencies ORDER BY rowid"
+            ).fetchall()
+
+        with self.assertRaises(ValueError):
+            self.broker.submit_graph("once", [graph_node("second")])
+
+        with sqlite3.connect(self.path) as db:
+            after_jobs = db.execute("SELECT * FROM jobs ORDER BY id").fetchall()
+            after_deps = db.execute(
+                "SELECT * FROM graph_dependencies ORDER BY rowid"
+            ).fetchall()
+            workflow_count = db.execute(
+                "SELECT COUNT(*) FROM graph_workflows"
+            ).fetchone()[0]
+
+        self.assertEqual(before_jobs, after_jobs)
+        self.assertEqual(before_deps, after_deps)
+        self.assertEqual(workflow_count, 1)
+
+    def test_graph_status_name_errors(self):
+        with self.assertRaises(ValueError):
+            self.broker.graph_status("bad workflow")
+        with self.assertRaises(KeyError):
+            self.broker.graph_status("never-registered")
+
+
+class GraphDeliveryTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self.path = Path(self._tmp.name, "graph-delivery.db")
+        self.broker = Broker(self.path)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def media_workflow_nodes(self):
+        return [
+            graph_node("transcode", key="transcode", payload="video"),
+            graph_node(
+                "publish",
+                key="publish-key",
+                payload="publish",
+                requires=["transcode"],
+            ),
+            graph_node(
+                "cleanup",
+                key="cleanup",
+                payload="clean",
+                after=["publish"],
+            ),
+            graph_node(
+                "audit",
+                key="audit",
+                payload="audit",
+                requires=["transcode", "publish"],
+            ),
+        ]
+
+    def test_requires_success_after_any_terminal_and_failure_skip(self):
+        ids = self.broker.submit_graph("media", self.media_workflow_nodes())
+
+        transcode = self.broker.take(now=0, lease=10)
+        self.assertEqual(transcode.id, ids["transcode"])
+        self.assertFalse(self.broker.fail(transcode, now=10))
+
+        redelivered = self.broker.take(now=10, lease=20)
+        self.assertEqual(redelivered.id, ids["transcode"])
+        self.assertNotEqual(redelivered.receipt, transcode.receipt)
+        self.assertFalse(self.broker.fail(transcode, now=11))
+        self.assertTrue(self.broker.fail(redelivered, now=11))
+
+        self.assertEqual(
+            self.broker.graph_status("media"),
+            {
+                "transcode": "failed",
+                "publish": "skipped",
+                "cleanup": "pending",
+                "audit": "skipped",
+            },
+        )
+
+        cleanup = self.broker.take(now=11, lease=10)
+        self.assertEqual(cleanup.id, ids["cleanup"])
+        self.assertTrue(self.broker.acknowledge(cleanup, now=12))
+        self.assertIsNone(self.broker.take(now=12, lease=10))
+
+        # Terminal statuses and credentials survive reopening.
+        reopened = Broker(self.path)
+        self.assertEqual(reopened.graph_status("media")["cleanup"], "succeeded")
+        self.assertFalse(reopened.acknowledge(cleanup, now=12))
+        self.assertFalse(reopened.fail(redelivered, now=12))
+
+    def test_fail_now_validation_and_ordinary_job_is_unchanged(self):
+        ordinary_id = self.broker.put_ordered(
+            "ordinary", key="ordinary-key", needs=None
+        )
+        delivery = self.broker.take(now=0, lease=10)
+
+        invalid_now = [-1, True, False, 1.5, "1", 2**63]
+        for now in invalid_now:
+            with self.subTest(now=now):
+                with self.assertRaises(ValueError):
+                    self.broker.fail(delivery, now=now)
+
+        with sqlite3.connect(self.path) as db:
+            before = db.execute(
+                "SELECT id, receipt, expires FROM jobs WHERE id = ?",
+                (ordinary_id,),
+            ).fetchone()
+
+        self.assertFalse(self.broker.fail(delivery, now=1))
+
+        with sqlite3.connect(self.path) as db:
+            after = db.execute(
+                "SELECT id, receipt, expires FROM jobs WHERE id = ?",
+                (ordinary_id,),
+            ).fetchone()
+        self.assertEqual(before, after)
+        self.assertTrue(self.broker.acknowledge(delivery, now=2))
+
+    def test_skipped_node_does_not_pass_old_same_key_head(self):
+        old_head = self.broker.put_ordered("old", key="asset", needs=None)
+        old_delivery = self.broker.take(now=0, lease=1000)
+        self.assertEqual(old_delivery.id, old_head)
+
+        ids = self.broker.submit_graph(
+            "wf",
+            [
+                graph_node("transcode", key="transcode"),
+                graph_node(
+                    "publish",
+                    key="asset",
+                    requires=["transcode"],
+                ),
+            ],
+        )
+        successor = self.broker.put_ordered(
+            "ordinary-successor", key="asset", needs=None
+        )
+
+        transcode = self.broker.take(now=0, lease=10)
+        self.assertEqual(transcode.id, ids["transcode"])
+        self.assertTrue(self.broker.fail(transcode, now=1))
+        self.assertEqual(self.broker.graph_status("wf")["publish"], "skipped")
+
+        # The still-leased old head has a larger effective block than the
+        # skipped graph node, so the ordinary successor cannot be claimed.
+        self.assertEqual(
+            self.broker.take_batch(
+                {"plain": frozenset()}, now=2, lease=10
+            ),
+            {},
+        )
+        self.assertTrue(self.broker.acknowledge(old_delivery, now=3))
+        next_job = self.broker.take(now=3, lease=10)
+        self.assertEqual(next_job.id, successor)
+
+    def test_subprocess_failure_persists_for_new_process_cleanup(self):
+        old_id = self.broker.put_ordered("old", key="asset", needs=None)
+        old_delivery = self.broker.take(now=0, lease=1000)
+        self.assertEqual(old_delivery.id, old_id)
+
+        ids = self.broker.submit_graph("subprocess-media", self.media_workflow_nodes())
+        successor = self.broker.put_ordered(
+            "asset-successor", key="asset", needs=None
+        )
+
+        first = self.broker.take(now=0, lease=10)
+        self.assertEqual(first.id, ids["transcode"])
+        self.assertFalse(self.broker.fail(first, now=10))
+        current = self.broker.take(now=10, lease=1000)
+        self.assertEqual(current.id, ids["transcode"])
+
+        project_root = Path(__file__).resolve().parent
+        child_code = """
+import os
+import sys
+sys.path.insert(0, os.environ["BROKER_PROJECT_ROOT"])
+from broker import Broker, Delivery
+
+broker = Broker(os.environ["BROKER_PATH"])
+delivery = Delivery(
+    int(os.environ["DELIVERY_ID"]),
+    os.environ["DELIVERY_PAYLOAD"],
+    os.environ["DELIVERY_RECEIPT"],
+)
+succeeded = broker.fail(delivery, now=11)
+raise SystemExit(0 if succeeded else 3)
+"""
+        env = dict(
+            os.environ,
+            BROKER_PROJECT_ROOT=str(project_root),
+            BROKER_PATH=str(self.path),
+            DELIVERY_ID=str(current.id),
+            DELIVERY_PAYLOAD=current.payload or "",
+            DELIVERY_RECEIPT=current.receipt,
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", child_code],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+        reopened = Broker(self.path)
+        status = reopened.graph_status("subprocess-media")
+        self.assertEqual(status["transcode"], "failed")
+        self.assertEqual(status["publish"], "skipped")
+        self.assertEqual(status["audit"], "skipped")
+        self.assertEqual(status["cleanup"], "pending")
+
+        cleanup = reopened.take(now=11, lease=10)
+        self.assertEqual(cleanup.id, ids["cleanup"])
+        self.assertTrue(reopened.acknowledge(cleanup, now=12))
+
+        # Cleanup has another key; the asset key still waits for its old head.
+        self.assertEqual(
+            reopened.take_batch({"plain": frozenset()}, now=12, lease=10),
+            {},
+        )
+        self.assertTrue(reopened.acknowledge(old_delivery, now=13))
+        asset_next = reopened.take(now=13, lease=10)
+        self.assertEqual(asset_next.id, successor)
+
+    def test_forward_dependency_batch_keeps_key_order_and_assignment(self):
+        self.broker.submit_graph(
+            "batch-graph",
+            [
+                graph_node(
+                    "publish",
+                    key="asset",
+                    requires=["transcode"],
+                ),
+                graph_node("asset-child", key="asset"),
+                graph_node(
+                    "transcode",
+                    key="transcode",
+                    needs=frozenset({"gpu"}),
+                ),
+            ],
+        )
+        generic_id = self.broker.put_ordered(
+            "generic", key="other", needs=None
+        )
+        gpu_id = self.broker.put_ordered(
+            "gpu-job", key="gpu-key", needs=frozenset({"gpu"})
+        )
+
+        workers = {
+            "plain-0": frozenset(),
+            "plain-1": frozenset(),
+            "gpu-0": frozenset({"gpu"}),
+            "gpu-1": frozenset({"gpu"}),
+        }
+        batch = self.broker.take_batch(workers, now=0, lease=10)
+        ids_by_slot = {slot: delivery.id for slot, delivery in batch.items()}
+
+        # publish=1 and asset-child=2 are absent; transcode=3, generic=4 and
+        # the independent GPU job=5 are all assigned compatibly.
+        self.assertEqual(
+            ids_by_slot,
+            {
+                "gpu-0": 3,
+                "gpu-1": gpu_id,
+                "plain-0": generic_id,
+            },
+        )
+
+    def test_concurrent_success_and_failure_have_one_winner(self):
+        ids = self.broker.submit_graph(
+            "race",
+            [
+                graph_node("root", key="root"),
+                graph_node(
+                    "child",
+                    key="child",
+                    requires=["root"],
+                ),
+            ],
+        )
+        delivery = self.broker.take(now=0, lease=1000)
+        barrier = threading.Barrier(2)
+
+        def acknowledge():
+            broker = Broker(self.path)
+            barrier.wait(timeout=10)
+            return broker.acknowledge(delivery, now=1)
+
+        def fail():
+            broker = Broker(self.path)
+            barrier.wait(timeout=10)
+            return broker.fail(delivery, now=1)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            ack_result = pool.submit(acknowledge)
+            fail_result = pool.submit(fail)
+            acknowledged = ack_result.result(timeout=30)
+            failed = fail_result.result(timeout=30)
+
+        self.assertEqual(int(acknowledged) + int(failed), 1)
+        reopened = Broker(self.path)
+        status = reopened.graph_status("race")
+        if acknowledged:
+            self.assertTrue(acknowledged)
+            self.assertFalse(failed)
+            self.assertEqual(status["root"], "succeeded")
+            self.assertEqual(status["child"], "pending")
+            child = reopened.take(now=1, lease=10)
+            self.assertEqual(child.id, ids["child"])
+        else:
+            self.assertFalse(acknowledged)
+            self.assertTrue(failed)
+            self.assertEqual(status["root"], "failed")
+            self.assertEqual(status["child"], "skipped")
+            self.assertIsNone(reopened.take(now=1, lease=10))
+
+    def test_sequential_terminal_races_reject_old_credentials(self):
+        ids = self.broker.submit_graph(
+            "both-orders",
+            [
+                graph_node("root", key="root"),
+                graph_node("child", key="child", requires=["root"]),
+            ],
+        )
+
+        success_delivery = self.broker.take(now=0, lease=100)
+        self.assertTrue(self.broker.acknowledge(success_delivery, now=1))
+        self.assertFalse(self.broker.fail(success_delivery, now=2))
+        self.assertEqual(
+            self.broker.graph_status("both-orders")["root"], "succeeded"
+        )
+        child = self.broker.take(now=2, lease=10)
+        self.assertEqual(child.id, ids["child"])
+
+        # A second workflow exercises fail-first ordering.
+        ids = self.broker.submit_graph(
+            "fail-first",
+            [
+                graph_node("root", key="root2"),
+                graph_node("child", key="child2", requires=["root"]),
+            ],
+        )
+        fail_delivery = self.broker.take(now=2, lease=100)
+        self.assertTrue(self.broker.fail(fail_delivery, now=3))
+        self.assertFalse(self.broker.acknowledge(fail_delivery, now=4))
+        status = Broker(self.path).graph_status("fail-first")
+        self.assertEqual(status["root"], "failed")
+        self.assertEqual(status["child"], "skipped")
+
+
+class GraphCompatibilityAndScaleTest(unittest.TestCase):
+    def test_legacy_noninteger_expiry_high_sequence_and_graph_take(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp, "legacy-graph.db")
+            db = sqlite3.connect(path)
+            db.execute(
+                """CREATE TABLE jobs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    payload TEXT NOT NULL,
+                    receipt TEXT,
+                    expires INTEGER NOT NULL DEFAULT 0
+                )"""
+            )
+            db.execute(
+                "INSERT INTO jobs(id, payload, receipt, expires) "
+                "VALUES (7, 'before', 'receipt-before', 10.5)"
+            )
+            db.execute(
+                "INSERT INTO jobs(id, payload, receipt, expires) "
+                "VALUES (8, 'boundary', 'receipt-boundary', 10.5)"
+            )
+            db.execute(
+                "INSERT INTO jobs(id, payload, receipt, expires) "
+                "VALUES (9, 'pending', NULL, 0)"
+            )
+            db.execute(
+                "UPDATE sqlite_sequence SET seq = 100 WHERE name = 'jobs'"
+            )
+            db.commit()
+            db.close()
+
+            broker = Broker(path)
+            before_delivery = Delivery(7, "before", "receipt-before")
+            boundary_delivery = Delivery(8, "boundary", "receipt-boundary")
+
+            with sqlite3.connect(path) as check:
+                preserved = check.execute(
+                    "SELECT expires, typeof(expires) FROM jobs WHERE id = 7"
+                ).fetchone()
+            self.assertEqual(preserved, (10.5, "real"))
+
+            # Before the non-integral expiry the original receipt works.
+            self.assertTrue(broker.acknowledge(before_delivery, now=10))
+            # now == expires is still the strict expiry boundary.
+            self.assertFalse(broker.acknowledge(boundary_delivery, now=10.5))
+
+            new_id = broker.put_ordered(
+                "high-water", key="high-key", needs=None
+            )
+            self.assertEqual(new_id, 101)
+            graph_ids = broker.submit_graph(
+                "legacy-graph",
+                [
+                    graph_node("root", key="graph-root"),
+                    graph_node(
+                        "child",
+                        key="graph-child",
+                        requires=["root"],
+                    ),
+                ],
+            )
+            self.assertEqual(graph_ids, {"root": 102, "child": 103})
+
+            workers = {"slot": frozenset()}
+            first = broker.take_batch(workers, now=0, lease=10)
+            self.assertEqual(first["slot"].id, 9)
+            self.assertTrue(broker.acknowledge(first["slot"], now=1))
+
+            high_water_job = broker.take(now=1, lease=10)
+            self.assertEqual(high_water_job.id, 101)
+            self.assertTrue(broker.acknowledge(high_water_job, now=2))
+
+            root = broker.take(now=2, lease=10)
+            self.assertEqual(root.id, 102)
+            self.assertTrue(broker.acknowledge(root, now=3))
+            child = broker.take(now=3, lease=10)
+            self.assertEqual(child.id, 103)
+
+    def test_graph_dependency_limit_is_enforced_atomically(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp, "dependency-limit.db")
+            broker = Broker(path)
+
+            def nodes(extra_edge):
+                result = [
+                    graph_node(f"prereq-{index:05d}", key=f"pkey-{index}")
+                    for index in range(480)
+                ]
+                for dependent in range(100):
+                    result.append(
+                        graph_node(
+                            f"dependent-{dependent}",
+                            key=f"dkey-{dependent}",
+                            requires=[f"prereq-{i:05d}" for i in range(480)],
+                        )
+                    )
+                if extra_edge:
+                    result.append(
+                        graph_node(
+                            "one-too-many",
+                            key="one-too-many",
+                            requires=["prereq-00000"],
+                        )
+                    )
+                return result
+
+            with self.assertRaises(ValueError):
+                broker.submit_graph("too-many-deps", nodes(True))
+            with sqlite3.connect(path) as db:
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0], 0)
+                self.assertEqual(
+                    db.execute(
+                        "SELECT COUNT(*) FROM graph_workflows"
+                    ).fetchone()[0],
+                    0,
+                )
+
+            broker.submit_graph("exact-deps", nodes(False))
+            with sqlite3.connect(path) as db:
+                self.assertEqual(
+                    db.execute(
+                        "SELECT COUNT(*) FROM graph_dependencies"
+                    ).fetchone()[0],
+                    48_000,
+                )
+
+    def test_12000_node_graph_releases_first_24_after_prerequisite(self):
+        class FastCommitBroker(Broker):
+            def _connect(self):
+                connection = super()._connect()
+                connection.execute("PRAGMA synchronous=OFF")
+                return connection
+
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp, "graph-scale.db")
+            broker = FastCommitBroker(path)
+            nodes = [graph_node("root", key="root", payload="small")]
+            nodes.extend(
+                graph_node(
+                    f"node-{index:05d}",
+                    key=f"key-{index:05d}",
+                    payload="small",
+                    requires=["root"],
+                )
+                for index in range(1, MAX_GRAPH_NODES)
+            )
+
+            ids = broker.submit_graph("large-graph", nodes)
+            self.assertEqual(len(ids), MAX_GRAPH_NODES)
+
+            workers = {
+                f"worker-{index:02d}": frozenset() for index in range(24)
+            }
+            before_root = broker.take_batch(workers, now=0, lease=10)
+            self.assertEqual(
+                [delivery.id for delivery in before_root.values()],
+                [ids["root"]],
+            )
+            self.assertTrue(
+                broker.acknowledge(before_root[next(iter(before_root))], now=1)
+            )
+
+            first_batch = broker.take_batch(workers, now=1, lease=10)
+            self.assertEqual(len(first_batch), 24)
+            self.assertEqual(
+                sorted(delivery.id for delivery in first_batch.values()),
+                list(range(2, 26)),
+            )
+
+    def test_failure_batch_skip_does_not_load_payloads_in_python(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp, "graph-memory.db")
+            broker = Broker(path)
+            payload = "a" * 16 * 1024
+            nodes = [graph_node("root", key="root", payload=payload)]
+            nodes.extend(
+                graph_node(
+                    f"skip-{index:04d}",
+                    key=f"skip-key-{index:04d}",
+                    payload=payload,
+                    requires=["root"],
+                )
+                for index in range(1534)
+            )
+            nodes.append(
+                graph_node(
+                    "cleanup",
+                    key="cleanup-key",
+                    payload=payload,
+                    after=["root"],
+                )
+            )
+            ids = broker.submit_graph("memory-graph", nodes)
+            self.assertEqual(len(ids), 1536)
+
+            root_delivery = broker.take(now=0, lease=100)
+            self.assertEqual(root_delivery.id, ids["root"])
+
+            started_here = False
+            if not tracemalloc.is_tracing():
+                tracemalloc.start()
+                started_here = True
+            else:
+                tracemalloc.reset_peak()
+
+            before_current, _ = tracemalloc.get_traced_memory()
+            try:
+                self.assertTrue(broker.fail(root_delivery, now=1))
+                _, peak = tracemalloc.get_traced_memory()
+                self.assertLessEqual(
+                    peak - before_current, 8 * 1024 * 1024
+                )
+            finally:
+                if started_here and tracemalloc.is_tracing():
+                    tracemalloc.stop()
+
+            status = broker.graph_status("memory-graph")
+            self.assertEqual(status["root"], "failed")
+            self.assertEqual(status["cleanup"], "pending")
+            skipped = [name for name, value in status.items() if value == "skipped"]
+            self.assertEqual(len(skipped), 1534)
+
+            cleanup = broker.take(now=1, lease=10)
+            self.assertEqual(cleanup.id, ids["cleanup"])
+            self.assertTrue(broker.acknowledge(cleanup, now=2))
 
 
 if __name__ == "__main__":

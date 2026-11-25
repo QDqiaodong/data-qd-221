@@ -9,6 +9,7 @@ exactly-once processing.
 from contextlib import closing
 from dataclasses import dataclass
 from typing import Optional
+from collections import deque
 import re
 import sqlite3
 import uuid
@@ -21,6 +22,8 @@ _NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
 _PAYLOAD_LIMIT = 16 * 1024
 _MAX_SQLITE_INTEGER = (1 << 63) - 1
 MAX_WORKERS = 24
+MAX_GRAPH_NODES = 12_000
+MAX_GRAPH_DEPENDENCIES = 48_000
 
 CAPABILITIES = (
     "gpu",
@@ -65,6 +68,19 @@ def _validate_name(value, kind):
         raise ValueError(
             f"{kind} must be 1-64 ASCII letters, digits, underscores, or hyphens"
         )
+
+
+def _validate_payload(payload):
+    if payload is None:
+        return
+    if not isinstance(payload, str):
+        raise ValueError("payload must be a UTF-8 string or None")
+    try:
+        payload_size = len(payload.encode("utf-8"))
+    except UnicodeEncodeError as exc:
+        raise ValueError("payload must be encodable as UTF-8") from exc
+    if payload_size > _PAYLOAD_LIMIT:
+        raise ValueError("payload must be at most 16 KiB of UTF-8")
 
 
 def _capability_mask(capabilities, *, nullable=False):
@@ -149,7 +165,44 @@ class Broker:
                 "CREATE INDEX IF NOT EXISTS idx_jobs_resource_key_id "
                 "ON jobs(resource_key, id)"
             )
+            self._create_graph_schema(db)
             db.commit()
+
+    @staticmethod
+    def _create_graph_schema(db):
+        db.execute(
+            """CREATE TABLE IF NOT EXISTS graph_workflows (
+                workflow_id TEXT PRIMARY KEY
+            )"""
+        )
+        db.execute(
+            """CREATE TABLE IF NOT EXISTS graph_nodes (
+                job_id INTEGER PRIMARY KEY,
+                workflow_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (status IN (
+                        'pending', 'succeeded', 'failed', 'skipped'
+                    )),
+                UNIQUE (workflow_id, name)
+            )"""
+        )
+        db.execute(
+            """CREATE TABLE IF NOT EXISTS graph_dependencies (
+                node_id INTEGER NOT NULL,
+                prerequisite_id INTEGER NOT NULL,
+                kind TEXT NOT NULL CHECK (kind IN ('requires', 'after')),
+                PRIMARY KEY (node_id, prerequisite_id)
+            )"""
+        )
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_graph_nodes_workflow "
+            "ON graph_nodes(workflow_id)"
+        )
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_graph_dependencies_prerequisite "
+            "ON graph_dependencies(prerequisite_id)"
+        )
 
     def _connect(self):
         db = sqlite3.connect(self.path, timeout=30)
@@ -227,16 +280,7 @@ class Broker:
     def put_ordered(self, payload, *, key, needs):
         _validate_name(key, "resource key")
         needs_mask = _capability_mask(needs, nullable=True)
-
-        if payload is not None:
-            if not isinstance(payload, str):
-                raise ValueError("payload must be a UTF-8 string or None")
-            try:
-                payload_size = len(payload.encode("utf-8"))
-            except UnicodeEncodeError as exc:
-                raise ValueError("payload must be encodable as UTF-8") from exc
-            if payload_size > _PAYLOAD_LIMIT:
-                raise ValueError("payload must be at most 16 KiB of UTF-8")
+        _validate_payload(payload)
 
         with closing(self._connect()) as db, db:
             job_id = db.execute(
@@ -245,6 +289,210 @@ class Broker:
                 (payload, key, needs_mask),
             ).lastrowid
             return int(job_id)
+
+    @staticmethod
+    def _validate_reference_list(value, field):
+        if not isinstance(value, list):
+            raise ValueError(f"{field} must be a list of node names")
+        names = []
+        seen = set()
+        for reference in value:
+            _validate_name(reference, "dependency node name")
+            if reference in seen:
+                raise ValueError(f"{field} contains duplicate node {reference!r}")
+            seen.add(reference)
+            names.append(reference)
+        return names, seen
+
+    @classmethod
+    def _validate_graph_nodes(cls, nodes):
+        if not isinstance(nodes, list) or not nodes:
+            raise ValueError("nodes must be a non-empty list")
+        if len(nodes) > MAX_GRAPH_NODES:
+            raise ValueError(
+                f"a graph may contain at most {MAX_GRAPH_NODES} nodes"
+            )
+
+        required_keys = {
+            "name",
+            "key",
+            "payload",
+            "needs",
+            "requires",
+            "after",
+        }
+        normalized = []
+        node_names = set()
+        dependency_count = 0
+
+        for raw_node in nodes:
+            if not isinstance(raw_node, dict):
+                raise ValueError("each graph node must be a dictionary")
+            missing = required_keys.difference(raw_node)
+            if missing:
+                raise ValueError(
+                    "graph node is missing required fields: "
+                    + ", ".join(sorted(missing))
+                )
+
+            name = raw_node["name"]
+            _validate_name(name, "node name")
+            if name in node_names:
+                raise ValueError(f"duplicate graph node name: {name!r}")
+
+            key = raw_node["key"]
+            _validate_name(key, "resource key")
+            payload = raw_node["payload"]
+            _validate_payload(payload)
+            needs_mask = _capability_mask(raw_node["needs"], nullable=True)
+
+            requires, requires_set = cls._validate_reference_list(
+                raw_node["requires"], "requires"
+            )
+            after, after_set = cls._validate_reference_list(
+                raw_node["after"], "after"
+            )
+            overlapping = requires_set.intersection(after_set)
+            if overlapping:
+                raise ValueError(
+                    "a node cannot list the same prerequisite in both "
+                    "requires and after: "
+                    + ", ".join(sorted(overlapping))
+                )
+
+            dependency_count += len(requires) + len(after)
+            if dependency_count > MAX_GRAPH_DEPENDENCIES:
+                raise ValueError(
+                    "a graph may contain at most "
+                    f"{MAX_GRAPH_DEPENDENCIES} explicit dependencies"
+                )
+
+            normalized.append(
+                {
+                    "name": name,
+                    "key": key,
+                    "payload": payload,
+                    "needs_mask": needs_mask,
+                    "requires": requires,
+                    "after": after,
+                }
+            )
+            node_names.add(name)
+
+        for node in normalized:
+            for reference in node["requires"] + node["after"]:
+                if reference == node["name"]:
+                    raise ValueError(
+                        f"node {node['name']!r} cannot depend on itself"
+                    )
+                if reference not in node_names:
+                    raise ValueError(
+                        f"node {node['name']!r} references unknown node "
+                        f"{reference!r}"
+                    )
+
+        cls._reject_graph_cycle(normalized)
+        return normalized
+
+    @staticmethod
+    def _reject_graph_cycle(nodes):
+        count = len(nodes)
+        index_by_name = {node["name"]: index for index, node in enumerate(nodes)}
+        adjacency = [[] for _ in range(count)]
+        indegree = [0] * count
+
+        def add_edge(prerequisite_index, dependent_index):
+            adjacency[prerequisite_index].append(dependent_index)
+            indegree[dependent_index] += 1
+
+        for dependent_index, node in enumerate(nodes):
+            for reference in node["requires"]:
+                add_edge(index_by_name[reference], dependent_index)
+            for reference in node["after"]:
+                add_edge(index_by_name[reference], dependent_index)
+
+        # Resource-key FIFO gives an earlier ID an ordering edge to later
+        # nodes on the same key.  Only consecutive nodes on that key need to
+        # be connected; transitive ordering handles the remaining pairs.
+        previous_by_key = {}
+        for index, node in enumerate(nodes):
+            previous_index = previous_by_key.get(node["key"])
+            if previous_index is not None:
+                add_edge(previous_index, index)
+            previous_by_key[node["key"]] = index
+
+        ready = deque(index for index, degree in enumerate(indegree) if degree == 0)
+        visited = 0
+        while ready:
+            node_index = ready.popleft()
+            visited += 1
+            for dependent_index in adjacency[node_index]:
+                indegree[dependent_index] -= 1
+                if indegree[dependent_index] == 0:
+                    ready.append(dependent_index)
+
+        if visited != count:
+            raise ValueError("graph dependencies contain a cycle")
+
+    def submit_graph(self, workflow_id, nodes):
+        _validate_name(workflow_id, "workflow ID")
+        normalized_nodes = self._validate_graph_nodes(nodes)
+
+        with closing(self._connect()) as db:
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                try:
+                    db.execute(
+                        "INSERT INTO graph_workflows(workflow_id) VALUES (?)",
+                        (workflow_id,),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    raise ValueError(
+                        f"workflow_id {workflow_id!r} has already been used"
+                    ) from exc
+
+                ids_by_name = {}
+                for node in normalized_nodes:
+                    job_id = db.execute(
+                        "INSERT INTO jobs(payload, resource_key, needs_mask) "
+                        "VALUES (?, ?, ?)",
+                        (
+                            node["payload"],
+                            node["key"],
+                            node["needs_mask"],
+                        ),
+                    ).lastrowid
+                    job_id = int(job_id)
+                    ids_by_name[node["name"]] = job_id
+                    db.execute(
+                        "INSERT INTO graph_nodes"
+                        "(job_id, workflow_id, name, status) "
+                        "VALUES (?, ?, ?, 'pending')",
+                        (job_id, workflow_id, node["name"]),
+                    )
+
+                dependency_rows = []
+                for node in normalized_nodes:
+                    dependent_id = ids_by_name[node["name"]]
+                    for reference in node["requires"]:
+                        dependency_rows.append(
+                            (dependent_id, ids_by_name[reference], "requires")
+                        )
+                    for reference in node["after"]:
+                        dependency_rows.append(
+                            (dependent_id, ids_by_name[reference], "after")
+                        )
+                db.executemany(
+                    "INSERT INTO graph_dependencies"
+                    "(node_id, prerequisite_id, kind) VALUES (?, ?, ?)",
+                    dependency_rows,
+                )
+                db.commit()
+            except BaseException:
+                db.rollback()
+                raise
+
+            return ids_by_name
 
     def take(self, *, now, lease):
         _validate_clock(now, lease)
@@ -256,6 +504,29 @@ class Broker:
                      FROM jobs j
                     WHERE j.expires <= ?
                       AND j.needs_mask = 0
+                      AND NOT EXISTS (
+                            SELECT 1
+                              FROM graph_dependencies gd
+                              LEFT JOIN graph_nodes gp
+                                ON gp.job_id = gd.prerequisite_id
+                             WHERE gd.node_id = j.id
+                               AND (
+                                    (
+                                        gd.kind = 'requires'
+                                        AND (
+                                            gp.job_id IS NULL
+                                            OR gp.status <> 'succeeded'
+                                        )
+                                    )
+                                    OR (
+                                        gd.kind = 'after'
+                                        AND (
+                                            gp.job_id IS NULL
+                                            OR gp.status = 'pending'
+                                        )
+                                    )
+                               )
+                          )
                       AND (
                             j.resource_key IS NULL
                             OR j.id = (
@@ -334,6 +605,29 @@ class Broker:
             """SELECT j.id, j.needs_mask
                  FROM jobs j
                 WHERE j.expires <= ?
+                  AND NOT EXISTS (
+                        SELECT 1
+                          FROM graph_dependencies gd
+                          LEFT JOIN graph_nodes gp
+                            ON gp.job_id = gd.prerequisite_id
+                         WHERE gd.node_id = j.id
+                           AND (
+                                (
+                                    gd.kind = 'requires'
+                                    AND (
+                                        gp.job_id IS NULL
+                                        OR gp.status <> 'succeeded'
+                                    )
+                                )
+                                OR (
+                                    gd.kind = 'after'
+                                    AND (
+                                        gp.job_id IS NULL
+                                        OR gp.status = 'pending'
+                                    )
+                                )
+                           )
+                      )
                   AND (
                         j.resource_key IS NULL
                         OR j.id = (
@@ -420,9 +714,113 @@ class Broker:
 
     def acknowledge(self, delivery, *, now):
         with closing(self._connect()) as db, db:
+            db.execute("BEGIN IMMEDIATE")
             deleted = db.execute(
                 "DELETE FROM jobs "
                 "WHERE id = ? AND receipt = ? AND expires > ?",
                 (delivery.id, delivery.receipt, now),
             )
-            return deleted.rowcount == 1
+            if deleted.rowcount != 1:
+                return False
+
+            # Ordinary jobs have no graph_nodes row.  A graph node's terminal
+            # status and queue-row deletion commit together.
+            db.execute(
+                "UPDATE graph_nodes "
+                "SET status = 'succeeded' "
+                "WHERE job_id = ? AND status = 'pending'",
+                (delivery.id,),
+            )
+            return True
+
+    _SKIP_REQUIRES_CTE = """
+        WITH RECURSIVE skipped(node_id) AS (
+            SELECT gd.node_id
+              FROM graph_dependencies gd
+             WHERE gd.prerequisite_id = ?
+               AND gd.kind = 'requires'
+            UNION
+            SELECT gd.node_id
+              FROM graph_dependencies gd
+              JOIN skipped s ON s.node_id = gd.prerequisite_id
+             WHERE gd.kind = 'requires'
+        )
+    """
+
+    def _skip_requires_descendants(self, db, failed_job_id):
+        db.execute(
+            self._SKIP_REQUIRES_CTE
+            + """
+            UPDATE graph_nodes
+               SET status = 'skipped'
+             WHERE status = 'pending'
+               AND job_id IN (SELECT node_id FROM skipped)
+            """,
+            (failed_job_id,),
+        )
+        # Terminal graph nodes do not occupy key order.  Payload columns are
+        # never read here; all work stays inside SQLite.
+        db.execute(
+            self._SKIP_REQUIRES_CTE
+            + """
+            DELETE FROM jobs
+             WHERE id IN (SELECT node_id FROM skipped)
+            """,
+            (failed_job_id,),
+        )
+
+    def fail(self, delivery, now):
+        if not _is_integer(now):
+            raise ValueError("now must be an integer; booleans are not allowed")
+        if now < 0 or now > _MAX_SQLITE_INTEGER:
+            raise ValueError(
+                "now must be between 0 and the SQLite signed 64-bit maximum"
+            )
+
+        with closing(self._connect()) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            ended = db.execute(
+                """DELETE FROM jobs
+                    WHERE id = ?
+                      AND receipt = ?
+                      AND expires > ?
+                      AND EXISTS (
+                            SELECT 1
+                              FROM graph_nodes gn
+                             WHERE gn.job_id = jobs.id
+                               AND gn.status = 'pending'
+                      )""",
+                (delivery.id, delivery.receipt, now),
+            )
+            if ended.rowcount != 1:
+                return False
+
+            db.execute(
+                "UPDATE graph_nodes "
+                "SET status = 'failed' "
+                "WHERE job_id = ? AND status = 'pending'",
+                (delivery.id,),
+            )
+            self._skip_requires_descendants(db, delivery.id)
+            return True
+
+    def graph_status(self, workflow_id):
+        _validate_name(workflow_id, "workflow ID")
+
+        with closing(self._connect()) as db:
+            workflow = db.execute(
+                "SELECT 1 FROM graph_workflows WHERE workflow_id = ?",
+                (workflow_id,),
+            ).fetchone()
+            if workflow is None:
+                raise KeyError(workflow_id)
+
+            rows = db.execute(
+                "SELECT name, status "
+                "FROM graph_nodes "
+                "WHERE workflow_id = ? "
+                "ORDER BY rowid",
+                (workflow_id,),
+            ).fetchall()
+
+        return {name: status for name, status in rows}
