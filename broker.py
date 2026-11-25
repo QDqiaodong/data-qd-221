@@ -24,6 +24,9 @@ _MAX_SQLITE_INTEGER = (1 << 63) - 1
 MAX_WORKERS = 24
 MAX_GRAPH_NODES = 12_000
 MAX_GRAPH_DEPENDENCIES = 48_000
+MAX_SINKS = 32
+MAX_SINK_CAPACITY = 12_000
+MAX_OUTCOME_LIMIT = 128
 
 CAPABILITIES = (
     "gpu",
@@ -119,6 +122,39 @@ def _normalize_workers(workers):
     return normalized
 
 
+def _validate_capacity(capacity):
+    if not _is_integer(capacity):
+        raise ValueError("sink capacity must be an integer; booleans are not allowed")
+    if capacity < 1 or capacity > MAX_SINK_CAPACITY:
+        raise ValueError(
+            f"sink capacity must be between 1 and {MAX_SINK_CAPACITY}"
+        )
+    return capacity
+
+
+def _normalize_sinks(sinks):
+    """Return a de-duplicated tuple of registered sink names.
+
+    ``sinks`` is optional and defaults to "no sinks".  A tuple (not a set) is
+    required so ordering and duplicate detection stay explicit.
+    """
+    if sinks is None:
+        return ()
+    if not isinstance(sinks, tuple):
+        raise ValueError("sinks must be a tuple of registered sink names")
+    if len(sinks) > MAX_SINKS:
+        raise ValueError(f"at most {MAX_SINKS} sinks may be requested")
+    names = []
+    seen = set()
+    for name in sinks:
+        _validate_name(name, "sink name")
+        if name in seen:
+            raise ValueError(f"sinks contains duplicate name {name!r}")
+        seen.add(name)
+        names.append(name)
+    return tuple(names)
+
+
 def _can_match_all(task_masks, available_slots):
     """Check whether every mask in ``task_masks`` gets a distinct available slot."""
     owner = {}
@@ -166,6 +202,8 @@ class Broker:
                 "ON jobs(resource_key, id)"
             )
             self._create_graph_schema(db)
+            self._migrate_graph_nodes(db)
+            self._create_sink_schema(db)
             db.commit()
 
     @staticmethod
@@ -184,6 +222,7 @@ class Broker:
                     CHECK (status IN (
                         'pending', 'succeeded', 'failed', 'skipped'
                     )),
+                outcomes INTEGER NOT NULL DEFAULT 0,
                 UNIQUE (workflow_id, name)
             )"""
         )
@@ -203,6 +242,88 @@ class Broker:
             "CREATE INDEX IF NOT EXISTS idx_graph_dependencies_prerequisite "
             "ON graph_dependencies(prerequisite_id)"
         )
+
+    @staticmethod
+    def _create_sink_schema(db):
+        # Sink names use SQLite's default BINARY collation, so "Index" and
+        # "index" are distinct, case-sensitive keys.  Unregistered workflows
+        # and ordinary jobs have no graph_node_sinks rows and never allocate
+        # any outcome storage.
+        db.execute(
+            """CREATE TABLE IF NOT EXISTS sink_registry (
+                name TEXT PRIMARY KEY,
+                capacity INTEGER NOT NULL
+                    CHECK (capacity BETWEEN 1 AND 12000),
+                charged INTEGER NOT NULL DEFAULT 0
+            )"""
+        )
+        db.execute(
+            """CREATE TABLE IF NOT EXISTS sink_watermark (
+                sink_name TEXT PRIMARY KEY,
+                head_seq INTEGER NOT NULL DEFAULT 0
+            )"""
+        )
+        db.execute(
+            """CREATE TABLE IF NOT EXISTS graph_node_sinks (
+                node_id INTEGER NOT NULL,
+                sink_name TEXT NOT NULL
+            )"""
+        )
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_graph_node_sinks_sink "
+            "ON graph_node_sinks(sink_name, node_id)"
+        )
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_graph_node_sinks_node "
+            "ON graph_node_sinks(node_id, sink_name)"
+        )
+        # A node taking part in outcome delivery gets exactly one persistent
+        # outbox row.  Acknowledged rows are deleted, so a generated rowid
+        # (the outcome "seq") is never reused while any row survives, and
+        # AUTOINCREMENT keeps the high-water mark even across full deletes.
+        # This is what keeps delivery storage bounded: confirmed outcomes
+        # vanish once every sink has acknowledged them.
+        db.execute(
+            """CREATE TABLE IF NOT EXISTS outcome_stream (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                node_id INTEGER NOT NULL,
+                workflow_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                job_id INTEGER NOT NULL,
+                status TEXT NOT NULL
+                    CHECK (status IN ('succeeded', 'failed', 'skipped')),
+                UNIQUE (node_id)
+            )"""
+        )
+        db.execute(
+            """CREATE TABLE IF NOT EXISTS outcome_deliveries (
+                sink_name TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                node_id INTEGER NOT NULL,
+                PRIMARY KEY (sink_name, seq),
+                UNIQUE (sink_name, node_id)
+            )"""
+        )
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_outcome_deliveries_node "
+            "ON outcome_deliveries(node_id)"
+        )
+
+    @staticmethod
+    def _migrate_graph_nodes(db):
+        """Add the outcome marker to graph tables created by older versions.
+
+        ``ALTER ... DEFAULT 1`` marks every pre-existing node as already
+        recorded, so upgrading a live database never re-emits outcomes for
+        its historical terminal nodes.
+        """
+        columns = db.execute("PRAGMA table_info(graph_nodes)").fetchall()
+        names = {column[1] for column in columns}
+        if columns and "outcomes" not in names:
+            db.execute(
+                "ALTER TABLE graph_nodes "
+                "ADD COLUMN outcomes INTEGER NOT NULL DEFAULT 1"
+            )
 
     def _connect(self):
         db = sqlite3.connect(self.path, timeout=30)
@@ -434,9 +555,10 @@ class Broker:
         if visited != count:
             raise ValueError("graph dependencies contain a cycle")
 
-    def submit_graph(self, workflow_id, nodes):
+    def submit_graph(self, workflow_id, nodes, *, sinks=None):
         _validate_name(workflow_id, "workflow ID")
         normalized_nodes = self._validate_graph_nodes(nodes)
+        sink_names = _normalize_sinks(sinks)
 
         with closing(self._connect()) as db:
             db.execute("BEGIN IMMEDIATE")
@@ -450,6 +572,9 @@ class Broker:
                     raise ValueError(
                         f"workflow_id {workflow_id!r} has already been used"
                     ) from exc
+
+                node_count = len(normalized_nodes)
+                self._reserve_sink_capacity(db, sink_names, node_count)
 
                 ids_by_name = {}
                 for node in normalized_nodes:
@@ -466,10 +591,16 @@ class Broker:
                     ids_by_name[node["name"]] = job_id
                     db.execute(
                         "INSERT INTO graph_nodes"
-                        "(job_id, workflow_id, name, status) "
-                        "VALUES (?, ?, ?, 'pending')",
+                        "(job_id, workflow_id, name, status, outcomes) "
+                        "VALUES (?, ?, ?, 'pending', 0)",
                         (job_id, workflow_id, node["name"]),
                     )
+                    if sink_names:
+                        db.executemany(
+                            "INSERT INTO graph_node_sinks(node_id, sink_name) "
+                            "VALUES (?, ?)",
+                            [(job_id, name) for name in sink_names],
+                        )
 
                 dependency_rows = []
                 for node in normalized_nodes:
@@ -493,6 +624,306 @@ class Broker:
                 raise
 
             return ids_by_name
+
+    @staticmethod
+    def _reserve_sink_capacity(db, sink_names, node_count):
+        """Reserve ``node_count`` slots on each named sink or raise.
+
+        Unknown sinks raise ``ValueError`` even when some sink is full.
+        Insufficient capacity raises ``BufferError``.  The whole reservation
+        lives inside the caller's transaction, so two instances racing for the
+        last slot cannot both commit.
+        """
+        for name in sink_names:
+            row = db.execute(
+                "SELECT capacity, charged FROM sink_registry WHERE name = ?",
+                (name,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"sink {name!r} has not been registered")
+        for name in sink_names:
+            row = db.execute(
+                "SELECT capacity, charged FROM sink_registry WHERE name = ?",
+                (name,),
+            ).fetchone()
+            capacity, charged = row
+            if charged + node_count > capacity:
+                raise BufferError(
+                    f"sink {name!r} has no room for {node_count} node(s): "
+                    f"{charged}/{capacity} reserved"
+                )
+        db.executemany(
+            "UPDATE sink_registry SET charged = charged + ? WHERE name = ?",
+            [(node_count, name) for name in sink_names],
+        )
+
+    def register_sink(self, name, *, capacity):
+        _validate_name(name, "sink name")
+        _validate_capacity(capacity)
+
+        with closing(self._connect()) as db:
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                row = db.execute(
+                    "SELECT capacity FROM sink_registry WHERE name = ?",
+                    (name,),
+                ).fetchone()
+                if row is not None:
+                    if row[0] == capacity:
+                        db.rollback()
+                        return False
+                    raise ValueError(
+                        f"sink {name!r} is already registered with capacity "
+                        f"{row[0]}, not {capacity}"
+                    )
+
+                count = db.execute(
+                    "SELECT COUNT(*) FROM sink_registry"
+                ).fetchone()[0]
+                if count >= MAX_SINKS:
+                    raise ValueError(
+                        f"at most {MAX_SINKS} sinks may be registered"
+                    )
+                db.execute(
+                    "INSERT INTO sink_registry(name, capacity, charged) "
+                    "VALUES (?, ?, 0)",
+                    (name, capacity),
+                )
+                db.execute(
+                    "INSERT INTO sink_watermark(sink_name, head_seq) "
+                    "VALUES (?, 0)",
+                    (name,),
+                )
+                db.commit()
+            except BaseException:
+                db.rollback()
+                raise
+            return True
+
+    @staticmethod
+    def _require_registered_sink(db, name):
+        row = db.execute(
+            "SELECT 1 FROM sink_registry WHERE name = ?", (name,)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"sink {name!r} has not been registered")
+
+    def read_outcomes(self, name, *, limit):
+        _validate_name(name, "sink name")
+        if not _is_integer(limit):
+            raise ValueError("limit must be an integer; booleans are not allowed")
+        if limit < 1 or limit > MAX_OUTCOME_LIMIT:
+            raise ValueError(
+                f"limit must be between 1 and {MAX_OUTCOME_LIMIT}"
+            )
+
+        with closing(self._connect()) as db:
+            self._require_registered_sink(db, name)
+            rows = db.execute(
+                """SELECT os.seq, os.workflow_id, os.name, os.job_id,
+                          os.status
+                     FROM outcome_deliveries od
+                     JOIN outcome_stream os ON os.seq = od.seq
+                    WHERE od.sink_name = ?
+                    ORDER BY od.seq
+                    LIMIT ?""",
+                (name, limit),
+            ).fetchall()
+
+        return [
+            {
+                "seq": seq,
+                "workflow_id": workflow_id,
+                "name": node_name,
+                "job_id": job_id,
+                "status": status,
+            }
+            for seq, workflow_id, node_name, job_id, status in rows
+        ]
+
+    @staticmethod
+    def _validate_through(through):
+        if not _is_integer(through):
+            raise ValueError(
+                "through must be an integer; booleans are not allowed"
+            )
+        if through < 1 or through > _MAX_SQLITE_INTEGER:
+            raise ValueError(
+                "through must be between 1 and the SQLite signed 64-bit maximum"
+            )
+        return through
+
+    def ack_outcomes(self, name, *, through):
+        _validate_name(name, "sink name")
+        through = self._validate_through(through)
+
+        with closing(self._connect()) as db:
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                self._require_registered_sink(db, name)
+                watermark = db.execute(
+                    "SELECT head_seq FROM sink_watermark WHERE sink_name = ?",
+                    (name,),
+                ).fetchone()[0]
+                if through <= watermark:
+                    db.rollback()
+                    return False
+
+                # The boundary must name an outcome this sink can read right
+                # now.  A seq belonging to another sink, or one not yet
+                # generated, is rejected instead of silently acking a prefix.
+                boundary = db.execute(
+                    "SELECT 1 FROM outcome_deliveries "
+                    "WHERE sink_name = ? AND seq = ?",
+                    (name, through),
+                ).fetchone()
+                if boundary is None:
+                    raise ValueError(
+                        f"through={through} is not a readable outcome for "
+                        f"sink {name!r}"
+                    )
+
+                released = db.execute(
+                    "SELECT COUNT(*) FROM outcome_deliveries "
+                    "WHERE sink_name = ? AND seq <= ?",
+                    (name, through),
+                ).fetchone()[0]
+                db.execute(
+                    """CREATE TEMP TABLE IF NOT EXISTS released_nodes (
+                        node_id INTEGER PRIMARY KEY
+                    )"""
+                )
+                db.execute("DELETE FROM released_nodes")
+                db.execute(
+                    """INSERT OR IGNORE INTO released_nodes(node_id)
+                       SELECT node_id FROM outcome_deliveries
+                        WHERE sink_name = ? AND seq <= ?""",
+                    (name, through),
+                )
+                db.execute(
+                    "UPDATE sink_registry SET charged = charged - ? "
+                    "WHERE name = ?",
+                    (released, name),
+                )
+                db.execute(
+                    "DELETE FROM outcome_deliveries "
+                    "WHERE sink_name = ? AND seq <= ?",
+                    (name, through),
+                )
+                db.execute(
+                    "UPDATE sink_watermark SET head_seq = ? WHERE sink_name = ?",
+                    (through, name),
+                )
+                self._collect_garbage_outcomes(db)
+                db.commit()
+            except BaseException:
+                db.rollback()
+                raise
+            return True
+
+    @staticmethod
+    def _collect_garbage_outcomes(db):
+        # Once every requested sink has acknowledged an outcome, its stream
+        # row is dead storage.  Delete it now so the outbox never grows with
+        # the number of already confirmed outcomes.  graph_nodes keeps the
+        # terminal status for graph_status().
+        #
+        # Only nodes whose delivery row was just removed can have become
+        # garbage, so the scan is limited to ``released_nodes`` instead of
+        # walking the entire stream on every ack.
+        db.execute(
+            """DELETE FROM outcome_stream
+                WHERE node_id IN (SELECT node_id FROM released_nodes)
+                  AND NOT EXISTS (
+                        SELECT 1 FROM outcome_deliveries od
+                         WHERE od.node_id = outcome_stream.node_id
+                  )"""
+        )
+        db.execute("DELETE FROM released_nodes")
+
+    @staticmethod
+    def _record_outcomes(db, workflow_id, terminal_statuses):
+        """Append outcomes for newly terminal nodes of ``workflow_id``.
+
+        Newly terminal nodes are collected in a connection-local temp table
+        ranked by delivery order, then inserted into the outbox in that order.
+        A failing node is already terminal before this helper runs, so it
+        ranks first; nodes skipped in the same transaction follow in job-ID
+        order.  The AUTOINCREMENT high-water mark is never reused, so separate
+        transactions receive strictly larger seq values in commit order.
+
+        ``graph_nodes.outcomes`` is a permanent per-node marker.  It is
+        deliberately not reclaimed: the outbox rows themselves are deleted
+        after every sink acknowledges, and a later failure in the same
+        workflow must not re-emit an already delivered outcome.
+        """
+        status_filter = " OR ".join(
+            "gn.status = ?" for _ in terminal_statuses
+        )
+        db.execute(
+            """CREATE TEMP TABLE IF NOT EXISTS newly_recorded (
+                job_id INTEGER PRIMARY KEY,
+                rank INTEGER NOT NULL
+            )"""
+        )
+        db.execute("DELETE FROM newly_recorded")
+        db.execute(
+            f"""INSERT INTO newly_recorded(job_id, rank)
+               SELECT gn.job_id,
+                      ROW_NUMBER() OVER (
+                          ORDER BY (gn.status <> 'failed'), gn.job_id
+                      )
+                 FROM graph_nodes gn
+                WHERE gn.workflow_id = ?
+                  AND gn.outcomes = 0
+                  AND ({status_filter})
+                  AND EXISTS (
+                        SELECT 1 FROM graph_node_sinks gns
+                         WHERE gns.node_id = gn.job_id
+                      )""",
+            (workflow_id, *terminal_statuses),
+        )
+        db.execute(
+            """UPDATE graph_nodes SET outcomes = 1
+                WHERE job_id IN (SELECT job_id FROM newly_recorded)"""
+        )
+        db.execute(
+            """INSERT INTO outcome_stream
+                   (node_id, workflow_id, name, job_id, status)
+               SELECT gn.job_id, gn.workflow_id, gn.name, gn.job_id, gn.status
+                 FROM newly_recorded nr
+                 JOIN graph_nodes gn ON gn.job_id = nr.job_id
+                ORDER BY nr.rank"""
+        )
+        db.execute(
+            """INSERT INTO outcome_deliveries(sink_name, seq, node_id)
+               SELECT gns.sink_name, os.seq, os.node_id
+                 FROM outcome_stream os
+                 JOIN graph_node_sinks gns ON gns.node_id = os.node_id
+                 JOIN newly_recorded nr ON nr.job_id = os.node_id
+                ORDER BY os.seq, gns.sink_name"""
+        )
+
+    def _handle_graph_terminal(self, db, job_id, status):
+        """Record the outcome(s) for a node that just became terminal.
+
+        Runs in the caller's terminal transaction.  Capacity is never
+        consulted here: a workflow admitted at submit time must be able to
+        finish even when its sinks have become full, and a failure that
+        cascades skips must not request more room.
+        """
+        workflow_id = db.execute(
+            "SELECT workflow_id FROM graph_nodes WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()[0]
+        if status == "succeeded":
+            # Success only releases ``requires`` dependents; it never
+            # cascades skips, so only the node itself produces an outcome.
+            self._record_outcomes(db, workflow_id, ("succeeded",))
+        else:
+            # A failure makes skip propagation visible in the same
+            # transaction; delivery order puts the failed node first.
+            self._record_outcomes(db, workflow_id, ("failed", "skipped"))
 
     def take(self, *, now, lease):
         _validate_clock(now, lease)
@@ -724,13 +1155,16 @@ class Broker:
                 return False
 
             # Ordinary jobs have no graph_nodes row.  A graph node's terminal
-            # status and queue-row deletion commit together.
-            db.execute(
+            # status, queue-row deletion, dependency release and newly
+            # readable outcomes all commit together.
+            updated = db.execute(
                 "UPDATE graph_nodes "
                 "SET status = 'succeeded' "
                 "WHERE job_id = ? AND status = 'pending'",
                 (delivery.id,),
             )
+            if updated.rowcount == 1:
+                self._handle_graph_terminal(db, delivery.id, "succeeded")
             return True
 
     _SKIP_REQUIRES_CTE = """
@@ -802,6 +1236,7 @@ class Broker:
                 (delivery.id,),
             )
             self._skip_requires_descendants(db, delivery.id)
+            self._handle_graph_terminal(db, delivery.id, "failed")
             return True
 
     def graph_status(self, workflow_id):

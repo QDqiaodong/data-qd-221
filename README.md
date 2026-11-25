@@ -113,6 +113,43 @@ broker.graph_status("release-2026-11")
 
 `pending` 同时表示尚不可领、当前可领和已租约但未结束。非法工作流名抛 `ValueError`；名称合法但未登记抛 `KeyError`。重开数据库后状态和调度资格立即恢复，旧凭据不能改写终态。
 
+## 结论投递（下游接收方）
+
+索引、清理等下游不必轮询工作流，也不占用 worker 的领取/租约。它们先登记一个带容量的接收方，提交工作流时声明该工作流要把每个节点的结论投递给哪些接收方。
+
+```python
+broker.register_sink("index", capacity=3)     # 首次 True；同名同容量 False
+broker.register_sink("cleanup", capacity=3)
+
+broker.submit_graph(
+    "release-2026-12",
+    nodes,
+    sinks=("index", "cleanup"),               # 仅关键字；默认为空
+)
+```
+
+- 每个库至多 32 个接收方，名称与资源键同规则且区分大小写。`capacity` 是 1–12,000 的整数（不含 `bool`）。首次登记返回 `True`，同名同容量再次登记返回 `False`；同名不同容量、达到上限后新增或非法参数抛 `ValueError`。没有改容量或注销接口。
+- `sinks` 是由不同已登记名称组成的元组（最多 32 个）。工作流每个节点最终向每个接收方各交付一条结论。提交时按**节点总数**向每个接收方同时预留名额；任一接收方余额不足抛 `BufferError`。
+- 名额计数的是“该接收方尚未确认的节点”：等待依赖、等待领取、持有租约以及已进入终态尚未确认的节点都计入；确认后释放。普通任务、未指定 `sinks` 的历史/新工作流都不占名额、不产生结论。
+- 输入非法（未知接收方、重复名称、非法图、重复 `workflow_id`）抛 `ValueError`，即使同时余额不足也先报 `ValueError`。失败不写部分工作流、不占用工作流名、任务 ID 或任何接收方名额；预留与入队在同一 `BEGIN IMMEDIATE` 事务提交，两个实例争最后一格时不可能都成功。
+
+### 结论与确认
+
+节点在有效凭据下 `succeeded`/`failed`，或按 `requires` 规则被传播为 `skipped`，即形成结论；原队列移除、终态、依赖放行与该结论可读在同一事务生效。租约到期、失效回执、重复结束都不产生结论。**终态路径不再申请名额**，所以接收方名额已满也不会阻塞已准入工作流确认、失败或一次失败触发的全部跳过。
+
+```python
+outcomes = broker.read_outcomes("index", limit=50)
+# [{"seq": 12, "workflow_id": "...", "name": "publish",
+#   "job_id": 7, "status": "failed"}, ...]
+
+broker.ack_outcomes("index", through=outcomes[-1]["seq"])  # True
+```
+
+- 每条结论含 `seq`、`workflow_id`、`name`、`job_id`、`status`，不含 payload 或租约凭据。同一节点只有一个逻辑结论，多接收方看到相同 `seq`；全部结论的 `seq` 按产生顺序严格递增（允许间隔，不因确认或重开而复用）。一次失败先排失败节点，再排同事务新跳过的节点（按任务 ID 升序）；不同事务按提交先后排序，不按任务 ID。
+- `read_outcomes(name, *, limit)` 只读该接收方尚未确认的最早结论，按 `seq` 升序，至多 `limit` 条（1–128 的整数，不含 `bool`）。读取不占租约、不推进进度；重开数据库后未确认部分仍可重读。
+- 调用方先把已处理前缀持久化到下游，再调用 `ack_outcomes(name, *, through)`。`through` 须为正的 SQLite 有符号 64 位整数（不含 `bool`）。不大于该接收方水位（初始 0）时返回 `False` 且无副作用；高于水位时必须命中该接收方当前可读的一条结论，否则抛 `ValueError`（不接受别的接收方的序号或未来序号）。成功返回 `True`，一次确认该接收方截至该序号的全部未确认结论，按实际条数释放名额（不按序号差），不影响其他接收方，并发/重复确认不会多释放。
+- 结论一旦被所有目标接收方确认即回收其流存储，不会随已确认数量无限增长；已有 `graph_status` 的终态历史不受影响。
+
 ## 保序与调度规则
 
 - 每个资源键只有 ID 最小且尚未确认的队首任务可以参与分配。
@@ -134,8 +171,9 @@ broker.graph_status("release-2026-11")
 - `needs` 必须是 `frozenset[str]` 或 `None`；槽能力值必须是 `frozenset[str]`（无能力用空 `frozenset()`），标签必须来自上表。`workers` 本身可为 `None` 或 `{}`。
 - 新入口 payload 必须是字符串或 `None`，UTF-8 编码后不超过 16 KiB。
 - `now`、`lease` 必须是整数且不能是 `bool`；`now >= 0`、`lease > 0`、`now + lease <= 2**63 - 1`。
+- `sinks` 必须是元组，元素为已登记名称；`capacity`、`limit`、`through` 的取值规则见上面的结论投递一节。
 
-现有数据库可直接由新版 `Broker(path)` 打开。初始化会在事务内补齐 `resource_key`、`needs_mask` 列，并额外创建 `graph_workflows`、`graph_nodes`、`graph_dependencies` 表；若旧表的 `payload TEXT NOT NULL` 阻碍空 payload，会重建 `jobs` 表并原样复制 ID、payload、receipt、expires，同时保留 AUTOINCREMENT 序列高水位和早期库中的非整数到期值。不需要清空或另建队列。
+现有数据库可直接由新版 `Broker(path)` 打开。初始化会在事务内补齐 `resource_key`、`needs_mask` 列，并额外创建 `graph_workflows`、`graph_nodes`、`graph_dependencies` 表；若旧表的 `payload TEXT NOT NULL` 阻碍空 payload，会重建 `jobs` 表并原样复制 ID、payload、receipt、expires，同时保留 AUTOINCREMENT 序列高水位和早期库中的非整数到期值。结论投递相关表（`sink_registry`、`sink_watermark`、`graph_node_sinks`、`outcome_stream`、`outcome_deliveries`）以 `IF NOT EXISTS` 补齐；旧版 `graph_nodes` 会新增 `outcomes` 列并以 `DEFAULT 1` 标记既有节点，因此升级不会补发旧终态结论、也不改写活跃租约。不需要清空或另建队列。
 
 ## 本地测试与演示
 
@@ -157,5 +195,10 @@ python3 -B demo.py
 - 旧库非整数到期值、AUTOINCREMENT 高水位迁移及图任务实际领取；
 - 12,000 条未确认任务/24 槽规模，以及 12,000 节点图前置完成后的首批 24 条；
 - 1,536 条 16 KiB payload 下，小批次领取和失败批量跳过都不会把大批 payload 装入 Python 内存（`tracemalloc` 峰值增量不超过 8 MiB）。
+- 接收方登记、容量预留、`BufferError`/`ValueError` 优先级、竞赛最后一格和失败后工作流名/任务 ID 复用；
+- 失败结论顺序、级联跳过的结论、失败不传播 `after`、多接收方相同序号、按提交顺序而非任务 ID 排序；
+- 确认边界校验（跨接收方/未来序号拒绝）、按实际条数释放、并发重复确认、确认后流存储回收；
+- 旧图库升级后不补发旧结论、原凭据与原依赖继续工作；
+- 12,000 节点、32 接收方、失败触发全量跳过时的分页读取与 `tracemalloc` 内存上限，以及只发给乙的结论在大量甲流之后的低成本单页读取。
 
 演示依次显示任务领取、重投、`stale ack: False`、`current ack: True` 和 `empty: True`。

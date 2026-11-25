@@ -9,7 +9,22 @@ import threading
 import tracemalloc
 import unittest
 
-from broker import CAPABILITIES, Broker, Delivery, MAX_GRAPH_NODES
+from broker import (
+    CAPABILITIES,
+    Broker,
+    Delivery,
+    MAX_GRAPH_NODES,
+    MAX_SINKS,
+)
+
+
+class FastCommitBroker(Broker):
+    """Test-only setup speedup; scheduling behavior and SQL are unchanged."""
+
+    def _connect(self):
+        connection = super()._connect()
+        connection.execute("PRAGMA synchronous=OFF")
+        return connection
 
 
 class BrokerTest(unittest.TestCase):
@@ -1360,6 +1375,952 @@ class GraphCompatibilityAndScaleTest(unittest.TestCase):
             cleanup = broker.take(now=1, lease=10)
             self.assertEqual(cleanup.id, ids["cleanup"])
             self.assertTrue(broker.acknowledge(cleanup, now=2))
+
+
+def sink_workflow_node(
+    name,
+    *,
+    key=None,
+    payload="payload",
+    requires=(),
+    after=(),
+):
+    return graph_node(
+        name,
+        key=key,
+        payload=payload,
+        requires=requires,
+        after=after,
+    )
+
+
+class SinkRegistrationTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self.path = Path(self._tmp.name, "sinks.db")
+        self.broker = Broker(self.path)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_register_first_duplicate_and_conflicts(self):
+        self.assertTrue(self.broker.register_sink("index", capacity=3))
+        self.assertFalse(self.broker.register_sink("index", capacity=3))
+        with self.assertRaises(ValueError):
+            self.broker.register_sink("index", capacity=4)
+
+        # Names stay case sensitive.
+        self.assertTrue(self.broker.register_sink("Index", capacity=1))
+        self.assertTrue(self.broker.register_sink("index-2", capacity=2))
+
+    def test_capacity_boundaries_are_inclusive(self):
+        self.assertTrue(self.broker.register_sink("low", capacity=1))
+        self.assertTrue(
+            self.broker.register_sink("high", capacity=12_000)
+        )
+        with self.assertRaises(ValueError):
+            self.broker.register_sink("too-high", capacity=12_001)
+        with self.assertRaises(ValueError):
+            self.broker.register_sink("too-low", capacity=0)
+
+    def test_invalid_registration_has_no_side_effects(self):
+        invalid = [
+            ("", 1),
+            ("bad name", 1),
+            ("x" * 65, 1),
+            (1, 1),
+            ("a", 0),
+            ("a", 12_001),
+            ("a", True),
+            ("a", 1.5),
+        ]
+        for name, capacity in invalid:
+            with self.subTest(name=name, capacity=capacity):
+                with self.assertRaises(ValueError):
+                    self.broker.register_sink(name, capacity=capacity)
+        with sqlite3.connect(self.path) as db:
+            self.assertEqual(
+                db.execute("SELECT COUNT(*) FROM sink_registry").fetchone()[0],
+                0,
+            )
+
+    def test_capacity_limit_and_no_unregister(self):
+        for index in range(MAX_SINKS):
+            self.assertTrue(
+                self.broker.register_sink(f"s{index}", capacity=1)
+            )
+        with self.assertRaises(ValueError):
+            self.broker.register_sink("one-more", capacity=1)
+        # Re-registering an existing sink at the limit is still allowed.
+        self.assertFalse(self.broker.register_sink("s0", capacity=1))
+
+    def test_read_and_ack_validate_unknown_sink_and_arguments(self):
+        self.broker.register_sink("index", capacity=2)
+
+        for limit in (0, 129, True, 1.5, "1"):
+            with self.subTest(limit=limit):
+                with self.assertRaises(ValueError):
+                    self.broker.read_outcomes("index", limit=limit)
+        with self.assertRaises(ValueError):
+            self.broker.read_outcomes("missing", limit=1)
+        with self.assertRaises(ValueError):
+            self.broker.read_outcomes("bad name", limit=1)
+
+        self.assertEqual(self.broker.read_outcomes("index", limit=1), [])
+
+        for through in (0, -1, 2**63, True, 1.5, "1"):
+            with self.subTest(through=through):
+                with self.assertRaises(ValueError):
+                    self.broker.ack_outcomes("index", through=through)
+        with self.assertRaises(ValueError):
+            self.broker.ack_outcomes("missing", through=1)
+
+
+class SinkSubmitTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self.path = Path(self._tmp.name, "sink-submit.db")
+        self.broker = Broker(self.path)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def snapshot(self):
+        with sqlite3.connect(self.path) as db:
+            return (
+                db.execute("SELECT id, payload FROM jobs ORDER BY id").fetchall(),
+                db.execute(
+                    "SELECT workflow_id FROM graph_workflows ORDER BY rowid"
+                ).fetchall(),
+                db.execute(
+                    "SELECT name, capacity, charged FROM sink_registry "
+                    "ORDER BY name"
+                ).fetchall(),
+                db.execute(
+                    "SELECT node_id, sink_name FROM graph_node_sinks "
+                    "ORDER BY node_id, sink_name"
+                ).fetchall(),
+                db.execute(
+                    "SELECT MAX(seq) FROM outcome_stream"
+                ).fetchone()[0],
+            )
+
+    def test_reserves_strictly_and_rejects_full_before_writing(self):
+        self.broker.register_sink("index", capacity=2)
+        nodes = [sink_workflow_node("a"), sink_workflow_node("b")]
+
+        before = self.snapshot()
+        self.broker.submit_graph("w1", nodes, sinks=("index",))
+        self.assertEqual(self.broker.read_outcomes("index", limit=1), [])
+
+        # Exactly full: another node cannot be admitted.
+        with self.assertRaises(BufferError):
+            self.broker.submit_graph(
+                "w2", [sink_workflow_node("c")], sinks=("index",)
+            )
+        with sqlite3.connect(self.path) as db:
+            self.assertEqual(
+                db.execute(
+                    "SELECT charged FROM sink_registry WHERE name = 'index'"
+                ).fetchone()[0],
+                2,
+            )
+            self.assertEqual(
+                db.execute(
+                    "SELECT COUNT(*) FROM graph_workflows"
+                ).fetchone()[0],
+                1,
+            )
+
+    def test_buffer_error_leaves_no_workflow_or_job_ids(self):
+        self.broker.register_sink("index", capacity=2)
+        self.broker.put_ordered("legacy", key="legacy", needs=None)
+
+        with self.assertRaises(BufferError):
+            self.broker.submit_graph(
+                "rejected",
+                [
+                    sink_workflow_node("a"),
+                    sink_workflow_node("b"),
+                    sink_workflow_node("c"),
+                ],
+                sinks=("index",),
+            )
+
+        # The workflow name and job IDs were never consumed.
+        ids = self.broker.submit_graph(
+            "accepted",
+            [sink_workflow_node("a")],
+            sinks=("index",),
+        )
+        self.assertEqual(ids, {"a": 2})
+        self.assertNotIn("rejected", self.workflow_names())
+
+    def workflow_names(self):
+        with sqlite3.connect(self.path) as db:
+            return {
+                row[0]
+                for row in db.execute(
+                    "SELECT workflow_id FROM graph_workflows"
+                ).fetchall()
+            }
+
+    def test_invalid_sinks_raise_value_error_even_when_full(self):
+        self.broker.register_sink("index", capacity=1)
+        self.broker.register_sink("cleanup", capacity=1)
+        # Fill both sinks so only validation can explain the failure.
+        self.broker.submit_graph(
+            "filler", [sink_workflow_node("only")], sinks=("index",)
+        )
+        self.broker.submit_graph(
+            "filler2", [sink_workflow_node("only2")], sinks=("cleanup",)
+        )
+
+        nodes = [sink_workflow_node("n1"), sink_workflow_node("n2")]
+        for sinks, exc_type in [
+            (("unknown",), ValueError),
+            (("index", "index"), ValueError),
+            (("index", "index", "cleanup"), ValueError),
+            (["index"], ValueError),
+            (("index",) * 33, ValueError),
+            (("index",), BufferError),
+        ]:
+            with self.subTest(sinks=sinks):
+                with self.assertRaises(exc_type):
+                    self.broker.submit_graph("bad", nodes, sinks=sinks)
+
+    def test_duplicate_workflow_name_wins_over_full_sink(self):
+        self.broker.register_sink("index", capacity=1)
+        self.broker.submit_graph(
+            "once", [sink_workflow_node("a")], sinks=("index",)
+        )
+        with self.assertRaises(ValueError):
+            self.broker.submit_graph(
+                "once", [sink_workflow_node("b")], sinks=("index",)
+            )
+
+    def test_ordinary_and_sinkless_workflows_never_reserve(self):
+        self.broker.register_sink("index", capacity=1)
+        self.broker.submit_graph("plain", [sink_workflow_node("only")])
+        self.broker.put_ordered("ordinary", key="ordinary", needs=None)
+
+        # The sinkless workflow leaves the single reserved slot untouched.
+        ids = self.broker.submit_graph(
+            "with-sink", [sink_workflow_node("watched")], sinks=("index",)
+        )
+        self.assertEqual(ids, {"watched": 3})
+        with sqlite3.connect(self.path) as db:
+            self.assertEqual(
+                db.execute(
+                    "SELECT COUNT(*) FROM graph_node_sinks"
+                ).fetchone()[0],
+                1,
+            )
+
+    def test_two_instances_race_for_the_last_slot(self):
+        self.broker.register_sink("index", capacity=1)
+        barrier = threading.Barrier(2)
+
+        def attempt(workflow_id):
+            broker = Broker(self.path)
+            barrier.wait(timeout=10)
+            try:
+                broker.submit_graph(
+                    workflow_id,
+                    [sink_workflow_node("only")],
+                    sinks=("index",),
+                )
+                return True
+            except BufferError:
+                return False
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [
+                pool.submit(attempt, "first"),
+                pool.submit(attempt, "second"),
+            ]
+            results = [future.result(timeout=30) for future in futures]
+
+        self.assertEqual(sum(results), 1)
+        winner, loser = (
+            ("first", "second") if results[0] else ("second", "first")
+        )
+
+        # Release the slot, then reuse the loser's untouched workflow name.
+        delivery = Broker(self.path).take(now=0, lease=10)
+        self.assertTrue(Broker(self.path).acknowledge(delivery, now=1))
+        outcome = Broker(self.path).read_outcomes("index", limit=1)[0]
+        self.assertTrue(
+            Broker(self.path).ack_outcomes("index", through=outcome["seq"])
+        )
+        Broker(self.path).submit_graph(
+            loser, [sink_workflow_node("retry")], sinks=("index",)
+        )
+
+
+class OutcomeDeliveryTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self.path = Path(self._tmp.name, "outcomes.db")
+        self.broker = Broker(self.path)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def three_node_workflow(self):
+        # transcode is declared after publish but publish requires it; cleanup
+        # only needs publish to reach any terminal state.
+        return [
+            sink_workflow_node(
+                "publish", key="asset", requires=["transcode"]
+            ),
+            sink_workflow_node("transcode", key="media"),
+            sink_workflow_node("cleanup", key="cleanup", after=["publish"]),
+        ]
+
+    def test_failure_outcome_order_skip_propagation_and_cleanup(self):
+        self.assertTrue(self.broker.register_sink("index", capacity=3))
+        self.assertTrue(self.broker.register_sink("cleanup-sink", capacity=3))
+        ids = self.broker.submit_graph(
+            "wf", self.three_node_workflow(), sinks=("index", "cleanup-sink")
+        )
+
+        first = self.broker.take(now=0, lease=10)
+        self.assertEqual(first.id, ids["transcode"])
+        # Expiry boundary: old receipt has no valid claim.
+        self.assertFalse(self.broker.fail(first, now=10))
+        current = self.broker.take(now=10, lease=10)
+        self.assertEqual(current.id, ids["transcode"])
+        self.assertNotEqual(current.receipt, first.receipt)
+        self.assertFalse(self.broker.fail(first, now=11))
+        self.assertTrue(self.broker.fail(current, now=11))
+
+        index_out = self.broker.read_outcomes("index", limit=10)
+        cleanup_out = self.broker.read_outcomes("cleanup-sink", limit=10)
+        self.assertEqual(index_out, cleanup_out)
+        self.assertEqual(
+            [(item["name"], item["status"]) for item in index_out],
+            [("transcode", "failed"), ("publish", "skipped")],
+        )
+        # The failure transaction orders by production while sharing seqs.
+        self.assertEqual([item["seq"] for item in index_out], [1, 2])
+
+        # A full sink does not block a node already admitted.
+        cleanup = self.broker.take(now=11, lease=10)
+        self.assertEqual(cleanup.id, ids["cleanup"])
+        self.assertTrue(self.broker.acknowledge(cleanup, now=12))
+        third = self.broker.read_outcomes("index", limit=10)[2]
+        self.assertEqual((third["name"], third["status"]), ("cleanup", "succeeded"))
+
+        reopened = Broker(self.path)
+        self.assertEqual(
+            reopened.graph_status("wf"),
+            {
+                "publish": "skipped",
+                "transcode": "failed",
+                "cleanup": "succeeded",
+            },
+        )
+        self.assertEqual(
+            reopened.read_outcomes("index", limit=10), index_out + [third]
+        )
+
+    def test_repeated_or_stale_terminal_operations_emit_nothing(self):
+        self.broker.register_sink("index", capacity=10)
+        ids = self.broker.submit_graph(
+            "wf",
+            [sink_workflow_node("root"), sink_workflow_node("leaf", requires=["root"])],
+            sinks=("index",),
+        )
+        delivery = self.broker.take(now=0, lease=100)
+        self.assertTrue(self.broker.acknowledge(delivery, now=1))
+        self.assertFalse(self.broker.fail(delivery, now=2))
+        self.assertFalse(self.broker.acknowledge(delivery, now=2))
+        out = self.broker.read_outcomes("index", limit=10)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["status"], "succeeded")
+
+    def test_skip_does_not_propagate_through_after(self):
+        self.broker.register_sink("index", capacity=10)
+        ids = self.broker.submit_graph(
+            "wf",
+            [
+                sink_workflow_node("root"),
+                sink_workflow_node("cleanup", after=["root"]),
+                sink_workflow_node("downstream", key="other", requires=["root"]),
+            ],
+            sinks=("index",),
+        )
+        root = self.broker.take(now=0, lease=10)
+        self.assertEqual(root.id, ids["root"])
+        self.assertTrue(self.broker.fail(root, now=1))
+        out = self.broker.read_outcomes("index", limit=10)
+        self.assertEqual(
+            [(item["name"], item["status"]) for item in out],
+            [("root", "failed"), ("downstream", "skipped")],
+        )
+
+        cleanup = self.broker.take(now=1, lease=10)
+        self.assertEqual(cleanup.id, ids["cleanup"])
+        self.assertTrue(self.broker.acknowledge(cleanup, now=2))
+        out = self.broker.read_outcomes("index", limit=10)
+        self.assertEqual(out[-1]["name"], "cleanup")
+
+    def test_same_seq_for_all_sinks_not_enqueue_id_order(self):
+        self.broker.register_sink("index", capacity=10)
+        self.broker.register_sink("cleanup", capacity=10)
+        ids = self.broker.submit_graph(
+            "wf",
+            [
+                sink_workflow_node("later_id_but_depends", key="x", requires=["first"]),
+                sink_workflow_node("first", key="first-key"),
+            ],
+            sinks=("index", "cleanup"),
+        )
+        first = self.broker.take(now=0, lease=10)
+        self.assertEqual(first.id, ids["first"])
+        self.assertTrue(self.broker.acknowledge(first, now=1))
+        second = self.broker.take(now=1, lease=10)
+        self.assertEqual(second.id, ids["later_id_but_depends"])
+        self.assertTrue(self.broker.acknowledge(second, now=2))
+
+        index_out = self.broker.read_outcomes("index", limit=10)
+        cleanup_out = self.broker.read_outcomes("cleanup", limit=10)
+        self.assertEqual([item["seq"] for item in index_out], [1, 2])
+        self.assertEqual(index_out, cleanup_out)
+        # seq order follows production, not the larger job ID.
+        self.assertEqual(index_out[1]["job_id"], ids["later_id_but_depends"])
+
+
+class OutcomeAcknowledgementTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self.path = Path(self._tmp.name, "acks.db")
+        self.broker = Broker(self.path)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_ack_boundary_must_belong_and_releases_actual_count(self):
+        self.broker.register_sink("index", capacity=4)
+        self.broker.register_sink("cleanup", capacity=4)
+        self.broker.submit_graph(
+            "shared",
+            [sink_workflow_node(f"n{i}", key=f"k{i}") for i in range(3)],
+            sinks=("index", "cleanup"),
+        )
+        for _ in range(3):
+            delivery = self.broker.take(now=0, lease=10)
+            self.assertTrue(self.broker.acknowledge(delivery, now=1))
+        index_out = self.broker.read_outcomes("index", limit=10)
+        cleanup_out = self.broker.read_outcomes("cleanup", limit=10)
+        self.assertEqual(index_out, cleanup_out)
+
+        # Ack the first two for index only.
+        self.assertTrue(
+            self.broker.ack_outcomes("index", through=index_out[1]["seq"])
+        )
+        self.assertFalse(
+            self.broker.ack_outcomes("index", through=index_out[1]["seq"])
+        )
+        self.assertEqual(self.broker.read_outcomes("index", limit=10), index_out[2:])
+        # Cleanup still sees the full, identical stream.
+        self.assertEqual(
+            self.broker.read_outcomes("cleanup", limit=10), cleanup_out
+        )
+        # Index's ack of the last shared seq is not a boundary for cleanup.
+        with self.assertRaises(ValueError):
+            self.broker.ack_outcomes(
+                "cleanup", through=index_out[2]["seq"] + 100
+            )
+
+        # Sharing with cleanup is now impossible (3 reserved, capacity 4), but
+        # an index-only workflow still fits; the rejected cleanup submit left
+        # index's reservation untouched.
+        with self.assertRaises(BufferError):
+            self.broker.submit_graph(
+                "needs-cleanup",
+                [sink_workflow_node("p", key="p1"), sink_workflow_node("q", key="p2")],
+                sinks=("cleanup",),
+            )
+
+        # Release enough capacity for a 1-node workflow to index only.
+        self.broker.submit_graph(
+            "index-only", [sink_workflow_node("solo")], sinks=("index",)
+        )
+        solo = self.broker.take(now=0, lease=10)
+        self.assertTrue(self.broker.acknowledge(solo, now=1))
+        self.assertEqual(
+            self.broker.read_outcomes("index", limit=10)[-1]["name"], "solo"
+        )
+
+    def test_interleaved_exclusive_and_shared_prefix_ack(self):
+        self.broker.register_sink("index", capacity=6)
+        self.broker.register_sink("cleanup", capacity=6)
+
+        counter = 0
+
+        def run(nodes, sinks):
+            nonlocal counter
+            counter += 1
+            self.broker.submit_graph(f"wf-{counter}", nodes, sinks=sinks)
+            for _ in nodes:
+                delivery = self.broker.take(now=0, lease=10)
+                self.assertTrue(self.broker.acknowledge(delivery, now=1))
+
+        run([sink_workflow_node("both-1", key="b1")], ("index", "cleanup"))
+        run([sink_workflow_node("idx-1", key="i1")], ("index",))
+        run([sink_workflow_node("both-2", key="b2")], ("index", "cleanup"))
+        run([sink_workflow_node("cln-1", key="c1")], ("cleanup",))
+        run([sink_workflow_node("iii", key="i3")], ("index",))
+
+        index_out = self.broker.read_outcomes("index", limit=10)
+        cleanup_out = self.broker.read_outcomes("cleanup", limit=10)
+        # Index exclusive seqs interleave with the shared ones; cleanup sees
+        # only its own exclusive + shared outcomes, with gaps in seq.
+        self.assertEqual(
+            [item["name"] for item in index_out],
+            ["both-1", "idx-1", "both-2", "iii"],
+        )
+        self.assertEqual(
+            [item["name"] for item in cleanup_out],
+            ["both-1", "both-2", "cln-1"],
+        )
+
+        # Confirm a prefix spanning exclusive and shared outcomes for index.
+        index_boundary = index_out[2]["seq"]
+        self.assertTrue(self.broker.ack_outcomes("index", through=index_boundary))
+        self.assertEqual(
+            [item["name"] for item in self.broker.read_outcomes("index", limit=10)],
+            ["iii"],
+        )
+        # Cleanup's retained prefix is measured against its own delivery
+        # rows (three), not the numeric seq distance index skipped.
+        self.assertEqual(
+            [item["name"] for item in self.broker.read_outcomes("cleanup", limit=10)],
+            ["both-1", "both-2", "cln-1"],
+        )
+        self.assertTrue(
+            self.broker.ack_outcomes(
+                "cleanup", through=cleanup_out[0]["seq"]
+            )
+        )
+        self.assertEqual(
+            [item["name"] for item in self.broker.read_outcomes("cleanup", limit=10)],
+            ["both-2", "cln-1"],
+        )
+        # Repeat ack is a no-op.
+        self.assertFalse(
+            self.broker.ack_outcomes(
+                "cleanup", through=cleanup_out[0]["seq"]
+            )
+        )
+        # Exactly 5 slots free on index (capacity 6 - 1 retained "iii"), so a
+        # 5-node workflow fits exactly and one more would overflow.
+        self.broker.submit_graph(
+            "fill-index",
+            [sink_workflow_node(f"f{i}", key=f"f{i}") for i in range(5)],
+            sinks=("index",),
+        )
+        with self.assertRaises(BufferError):
+            self.broker.submit_graph(
+                "overflow-index", [sink_workflow_node("x", key="x")],
+                sinks=("index",),
+            )
+
+    def test_cross_sink_and_future_boundaries_rejected(self):
+        self.broker.register_sink("a", capacity=3)
+        self.broker.register_sink("b", capacity=3)
+        self.broker.submit_graph(
+            "wf", [sink_workflow_node("n", key="kn")], sinks=("a",)
+        )
+        delivery = self.broker.take(now=0, lease=10)
+        self.assertTrue(self.broker.acknowledge(delivery, now=1))
+        seq = self.broker.read_outcomes("a", limit=1)[0]["seq"]
+
+        # "b" has no such seq, and even "a" rejects an unread future seq.
+        with self.assertRaises(ValueError):
+            self.broker.ack_outcomes("b", through=seq)
+        with self.assertRaises(ValueError):
+            self.broker.ack_outcomes("a", through=seq + 1)
+
+    def test_capacity_release_uses_actual_outcomes_not_seq_difference(self):
+        self.broker.register_sink("a", capacity=2)
+        self.broker.submit_graph(
+            "wf1", [sink_workflow_node("n1", key="k1")], sinks=("a",)
+        )
+        delivery = self.broker.take(now=0, lease=10)
+        self.assertTrue(self.broker.acknowledge(delivery, now=1))
+
+        # Only sink "b" consumes the next two outcomes, leaving a large gap
+        # in "a"'s seq range that must not inflate "a"'s released count.
+        self.broker.register_sink("b", capacity=5)
+        self.broker.submit_graph(
+            "wf2",
+            [sink_workflow_node("m1", key="k2"), sink_workflow_node("m2", key="k3")],
+            sinks=("b",),
+        )
+        for _ in range(2):
+            delivery = self.broker.take(now=1, lease=10)
+            self.assertTrue(self.broker.acknowledge(delivery, now=2))
+
+        out = self.broker.read_outcomes("a", limit=1)
+        self.assertEqual(len(out), 1)
+        self.assertTrue(self.broker.ack_outcomes("a", through=out[0]["seq"]))
+
+        # "a" released exactly its one outcome: it may now admit two nodes.
+        self.broker.submit_graph(
+            "wf3",
+            [sink_workflow_node("p1", key="k4"), sink_workflow_node("p2", key="k5")],
+            sinks=("a",),
+        )
+        with self.assertRaises(BufferError):
+            self.broker.submit_graph(
+                "wf4", [sink_workflow_node("q", key="k6")], sinks=("a",)
+            )
+
+    def test_acknowledged_stream_storage_is_reclaimed(self):
+        self.broker.register_sink("index", capacity=5)
+        self.broker.submit_graph(
+            "wf",
+            [sink_workflow_node(f"n{i}", key=f"k{i}") for i in range(4)],
+            sinks=("index",),
+        )
+        for _ in range(4):
+            delivery = self.broker.take(now=0, lease=10)
+            self.assertTrue(self.broker.acknowledge(delivery, now=1))
+        out = self.broker.read_outcomes("index", limit=10)
+        self.assertEqual(len(out), 4)
+        self.assertTrue(self.broker.ack_outcomes("index", through=out[-1]["seq"]))
+
+        with sqlite3.connect(self.path) as db:
+            self.assertEqual(
+                db.execute("SELECT COUNT(*) FROM outcome_stream").fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                db.execute(
+                    "SELECT COUNT(*) FROM outcome_deliveries"
+                ).fetchone()[0],
+                0,
+            )
+        # Terminal history remains intact.
+        self.assertEqual(
+            self.broker.graph_status("wf"),
+            {f"n{i}": "succeeded" for i in range(4)},
+        )
+        self.assertEqual(self.broker.read_outcomes("index", limit=10), [])
+
+
+class LegacySinkUpgradeTest(unittest.TestCase):
+    def test_old_graph_database_upgrades_without_reemitting(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp, "legacy-sink.db")
+            create_legacy_graph_database(path)
+
+            broker = Broker(path)
+            with sqlite3.connect(path) as db:
+                columns = [
+                    column[1]
+                    for column in db.execute(
+                        "PRAGMA table_info(graph_nodes)"
+                    ).fetchall()
+                ]
+            self.assertIn("outcomes", columns)
+            self.assertEqual(
+                broker.graph_status("old-wf"),
+                {"root": "succeeded", "pre": "pending", "succ": "pending"},
+            )
+
+            # The old receipt still works and produces no historical outcome.
+            self.assertTrue(
+                broker.acknowledge(Delivery(2, "pre", "r2"), now=10)
+            )
+
+            # New sinks can be registered later and new work delivered.
+            self.assertTrue(broker.register_sink("index", capacity=3))
+            ids = broker.submit_graph(
+                "new-wf",
+                [
+                    sink_workflow_node("dep", key="dep-key"),
+                    sink_workflow_node("sink-node", key="sink-key", requires=["dep"]),
+                ],
+                sinks=("index",),
+            )
+            self.assertEqual(
+                broker.graph_status("new-wf"),
+                {"dep": "pending", "sink-node": "pending"},
+            )
+
+            # Continue the old graph: succ releases after pre succeeds.
+            succ = broker.take(now=10, lease=5)
+            self.assertEqual(succ.id, 3)
+            self.assertTrue(broker.acknowledge(succ, now=11))
+            self.assertEqual(broker.read_outcomes("index", limit=5), [])
+
+    def test_new_sink_workflow_shares_queue_without_changing_order(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp, "legacy-sink-order.db")
+            create_legacy_graph_database(path)
+            broker = Broker(path)
+            broker.register_sink("index", capacity=5)
+
+            # A sink-enabled prereq and cleanup on the same keys as ordinary
+            # jobs must still honour explicit dependencies and key FIFO.
+            ids = broker.submit_graph(
+                "sink-wf",
+                [
+                    sink_workflow_node("pre", key="shared-key"),
+                    sink_workflow_node(
+                        "post", key="shared-key", requires=["pre"]
+                    ),
+                ],
+                sinks=("index",),
+            )
+            ordinary = broker.put_ordered(
+                "ordinary-after-post", key="shared-key", needs=None
+            )
+
+            # Release the legacy pending node first so its successor (id 3,
+            # an unkeyed job) is the earliest eligible delivery.
+            self.assertTrue(
+                broker.acknowledge(Delivery(2, "pre", "r2"), now=10)
+            )
+            first = broker.take(now=10, lease=20)
+            self.assertEqual(first.id, 3)
+            self.assertTrue(broker.acknowledge(first, now=11))
+
+            pre = broker.take(now=11, lease=10)
+            self.assertEqual(pre.id, ids["pre"])
+            self.assertTrue(broker.acknowledge(pre, now=12))
+
+            # post is now dependency-ready, but the ordinary successor on the
+            # same key is blocked by post, exactly as without sinks.
+            post = broker.take(now=12, lease=10)
+            self.assertEqual(post.id, ids["post"])
+            self.assertTrue(broker.acknowledge(post, now=13))
+
+            ordinary_delivery = broker.take(now=13, lease=10)
+            self.assertEqual(ordinary_delivery.id, ordinary)
+            self.assertTrue(broker.acknowledge(ordinary_delivery, now=14))
+
+            self.assertEqual(
+                [item["name"] for item in broker.read_outcomes("index", limit=5)],
+                ["pre", "post"],
+            )
+            # Sinkless ordinary jobs never enter the outcome stream.
+            self.assertEqual(len(broker.read_outcomes("index", limit=5)), 2)
+
+            # Others still see the sink-enabled workflow's cleanup outcome
+            # alongside the ordinary job, proving shared queue order holds.
+            self.assertEqual(
+                broker.graph_status("sink-wf"),
+                {"pre": "succeeded", "post": "succeeded"},
+            )
+
+    def test_old_workflow_does_not_reemit_terminal_outcomes(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp, "legacy-no-reemit.db")
+            create_legacy_graph_database(path)
+            broker = Broker(path)
+            broker.register_sink("index", capacity=5)
+
+            # root already succeeded before upgrades: no outcome is emitted.
+            ids = broker.submit_graph(
+                "new-wf", [sink_workflow_node("n", key="kn")], sinks=("index",)
+            )
+            delivery = broker.take(now=0, lease=10)
+            self.assertEqual(delivery.id, ids["n"])
+            broker.acknowledge(delivery, now=1)
+            self.assertEqual(
+                [item["name"] for item in broker.read_outcomes("index", limit=5)],
+                ["n"],
+            )
+
+
+def create_legacy_graph_database(path):
+    """Create a pre-outcome database with graph tables and active jobs."""
+    db = sqlite3.connect(path)
+    db.execute(
+        """CREATE TABLE jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            payload TEXT,
+            receipt TEXT,
+            expires INTEGER NOT NULL DEFAULT 0,
+            resource_key TEXT,
+            needs_mask INTEGER NOT NULL DEFAULT 0
+        )"""
+    )
+    db.execute(
+        "CREATE TABLE graph_workflows (workflow_id TEXT PRIMARY KEY)"
+    )
+    db.execute(
+        """CREATE TABLE graph_nodes (
+            job_id INTEGER PRIMARY KEY,
+            workflow_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending'
+                CHECK (status IN ('pending', 'succeeded', 'failed', 'skipped')),
+            UNIQUE (workflow_id, name)
+        )"""
+    )
+    db.execute(
+        """CREATE TABLE graph_dependencies (
+            node_id INTEGER NOT NULL,
+            prerequisite_id INTEGER NOT NULL,
+            kind TEXT NOT NULL CHECK (kind IN ('requires', 'after')),
+            PRIMARY KEY (node_id, prerequisite_id)
+        )"""
+    )
+    db.execute("INSERT INTO graph_workflows VALUES ('old-wf')")
+    db.execute(
+        "INSERT INTO jobs(id, payload, receipt, expires) VALUES (1, 'old-root', 'r1', 50)"
+    )
+    db.execute(
+        "INSERT INTO graph_nodes VALUES (1, 'old-wf', 'root', 'succeeded')"
+    )
+    db.execute(
+        "INSERT INTO jobs(id, payload, receipt, expires) VALUES (2, 'pre', 'r2', 100)"
+    )
+    db.execute(
+        "INSERT INTO graph_nodes VALUES (2, 'old-wf', 'pre', 'pending')"
+    )
+    db.execute(
+        "INSERT INTO jobs(id, payload, receipt, expires) VALUES (3, 'succ', 'r3', 0)"
+    )
+    db.execute(
+        "INSERT INTO graph_nodes VALUES (3, 'old-wf', 'succ', 'pending')"
+    )
+    db.execute("INSERT INTO graph_dependencies VALUES (3, 2, 'requires')")
+    db.execute("UPDATE sqlite_sequence SET seq = 3 WHERE name = 'jobs'")
+    db.commit()
+    db.close()
+
+
+class OutcomeScaleMemoryTest(unittest.TestCase):
+    def test_failure_skip_to_32_sinks_stays_small_and_paged(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp, "outcome-scale.db")
+            broker = FastCommitBroker(path)
+            sink_names = tuple(f"sink-{index:02d}" for index in range(MAX_SINKS))
+            for name in sink_names:
+                broker.register_sink(name, capacity=MAX_GRAPH_NODES)
+
+            payload = "a" * 16 * 1024
+            nodes = [graph_node("root", key="root", payload="small")]
+            nodes.extend(
+                graph_node(
+                    f"node-{index:05d}",
+                    key=f"key-{index:05d}",
+                    payload=payload if index < 512 else "small",
+                    requires=["root"],
+                )
+                for index in range(1, MAX_GRAPH_NODES)
+            )
+            ids = broker.submit_graph("large", nodes, sinks=sink_names)
+            self.assertEqual(len(ids), MAX_GRAPH_NODES)
+
+            root = broker.take(now=0, lease=100)
+            self.assertEqual(root.id, ids["root"])
+
+            started_here = False
+            if not tracemalloc.is_tracing():
+                tracemalloc.start()
+                started_here = True
+            else:
+                tracemalloc.reset_peak()
+            before_current, _ = tracemalloc.get_traced_memory()
+            try:
+                self.assertTrue(broker.fail(root, now=1))
+                _, peak = tracemalloc.get_traced_memory()
+                self.assertLessEqual(
+                    peak - before_current, 8 * 1024 * 1024
+                )
+            finally:
+                if started_here and tracemalloc.is_tracing():
+                    tracemalloc.stop()
+
+            status = broker.graph_status("large")
+            self.assertEqual(status["root"], "failed")
+            self.assertEqual(
+                sum(1 for value in status.values() if value == "skipped"),
+                MAX_GRAPH_NODES - 1,
+            )
+
+            first_sink = broker.read_outcomes(sink_names[0], limit=128)
+            self.assertEqual(len(first_sink), 128)
+            self.assertEqual(first_sink[0]["name"], "root")
+            self.assertEqual(first_sink[0]["status"], "failed")
+            self.assertEqual(first_sink[1]["status"], "skipped")
+
+            other_sink = broker.read_outcomes(sink_names[1], limit=128)
+            self.assertEqual(
+                [item["seq"] for item in first_sink],
+                [item["seq"] for item in other_sink],
+            )
+
+            # Drain one sink fully; the other can still reread from its head.
+            page = first_sink
+            while page:
+                self.assertTrue(
+                    broker.ack_outcomes(sink_names[0], through=page[-1]["seq"])
+                )
+                page = broker.read_outcomes(sink_names[0], limit=128)
+            self.assertEqual(broker.read_outcomes(sink_names[0], limit=1), [])
+
+            reread = broker.read_outcomes(sink_names[1], limit=1)
+            self.assertEqual(reread[0]["seq"], first_sink[0]["seq"])
+            self.assertEqual(reread[0]["name"], "root")
+
+    def test_isolated_sink_read_is_cheap_after_large_other_stream(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp, "outcome-isolated.db")
+            broker = FastCommitBroker(path)
+            broker.register_sink("A", capacity=MAX_GRAPH_NODES)
+            broker.register_sink("B", capacity=2)
+
+            nodes = [graph_node("root", key="root", payload="small")]
+            nodes.extend(
+                graph_node(
+                    f"node-{index:05d}",
+                    key=f"key-{index:05d}",
+                    payload="small",
+                    requires=["root"],
+                )
+                for index in range(1, MAX_GRAPH_NODES)
+            )
+            broker.submit_graph("to-a", nodes, sinks=("A",))
+            root = broker.take(now=0, lease=100)
+            self.assertTrue(broker.fail(root, now=1))
+            self.assertEqual(
+                len(broker.read_outcomes("A", limit=128)), 128
+            )
+
+            ids = broker.submit_graph(
+                "to-b", [graph_node("only", key="only")], sinks=("B",)
+            )
+            delivery = broker.take(now=1, lease=10)
+            self.assertEqual(delivery.id, ids["only"])
+            self.assertTrue(broker.acknowledge(delivery, now=2))
+
+            started_here = False
+            if not tracemalloc.is_tracing():
+                tracemalloc.start()
+                started_here = True
+            else:
+                tracemalloc.reset_peak()
+            before_current, _ = tracemalloc.get_traced_memory()
+            try:
+                out = broker.read_outcomes("B", limit=1)
+                _, peak = tracemalloc.get_traced_memory()
+                self.assertLessEqual(peak - before_current, 1 * 1024 * 1024)
+            finally:
+                if started_here and tracemalloc.is_tracing():
+                    tracemalloc.stop()
+
+            self.assertEqual(len(out), 1)
+            self.assertEqual(out[0]["name"], "only")
+            self.assertEqual(out[0]["workflow_id"], "to-b")
 
 
 if __name__ == "__main__":
