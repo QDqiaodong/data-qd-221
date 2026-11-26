@@ -33,6 +33,8 @@ MAX_FEED_PENDING = 12_000
 MAX_PUBLISH_LIMIT = 128
 MAX_MAINTENANCE_TICKETS = 12_000
 MAX_MAINTENANCE_KEYS = 8
+MAX_RACE_WAIT = 3_600
+MAX_RACE_HEDGES_PER_ROUND = 2
 
 CAPABILITIES = (
     "gpu",
@@ -298,8 +300,40 @@ class Broker:
                         'pending', 'succeeded', 'failed', 'skipped'
                     )),
                 outcomes INTEGER NOT NULL DEFAULT 0,
+                race_after INTEGER,
+                race_hedges INTEGER NOT NULL DEFAULT 0,
                 UNIQUE (workflow_id, name)
             )"""
+        )
+        # One row per execution credential issued for a hedge-enabled node.
+        # The logical node keeps a single ``jobs`` row and job ID; these rows
+        # only track the (possibly two) workers currently allowed to run it.
+        # A row is deleted when its execution wins, retires, or is pruned after
+        # natural expiry, so the table never accumulates a per-execution
+        # history.  ``resource_key`` is denormalized so a losing credential can
+        # keep blocking its key even after the node's ``jobs`` row is gone.
+        db.execute(
+            """CREATE TABLE IF NOT EXISTS race_leases (
+                job_id INTEGER NOT NULL,
+                receipt TEXT NOT NULL,
+                pool TEXT NOT NULL,
+                resource_key TEXT NOT NULL,
+                issued INTEGER NOT NULL,
+                expires INTEGER NOT NULL,
+                PRIMARY KEY (job_id, receipt)
+            )"""
+        )
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_race_leases_key_expires "
+            "ON race_leases(resource_key, expires)"
+        )
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_race_leases_job_expires "
+            "ON race_leases(job_id, expires)"
+        )
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_race_leases_expires "
+            "ON race_leases(expires)"
         )
         db.execute(
             """CREATE TABLE IF NOT EXISTS graph_dependencies (
@@ -493,11 +527,13 @@ class Broker:
 
     @staticmethod
     def _migrate_graph_nodes(db):
-        """Add the outcome marker to graph tables created by older versions.
+        """Add columns introduced by newer versions to old graph tables.
 
         ``ALTER ... DEFAULT 1`` marks every pre-existing node as already
         recorded, so upgrading a live database never re-emits outcomes for
-        its historical terminal nodes.
+        its historical terminal nodes.  ``race_after`` defaults to NULL
+        (hedging disabled) and ``race_hedges`` to 0, so old nodes and their
+        scheduling behaviour are untouched.
         """
         columns = db.execute("PRAGMA table_info(graph_nodes)").fetchall()
         names = {column[1] for column in columns}
@@ -505,6 +541,15 @@ class Broker:
             db.execute(
                 "ALTER TABLE graph_nodes "
                 "ADD COLUMN outcomes INTEGER NOT NULL DEFAULT 1"
+            )
+        if columns and "race_after" not in names:
+            db.execute(
+                "ALTER TABLE graph_nodes ADD COLUMN race_after INTEGER"
+            )
+        if columns and "race_hedges" not in names:
+            db.execute(
+                "ALTER TABLE graph_nodes "
+                "ADD COLUMN race_hedges INTEGER NOT NULL DEFAULT 0"
             )
 
     def _connect(self):
@@ -1079,10 +1124,44 @@ class Broker:
         if visited != count:
             raise ValueError("graph dependencies contain a cycle")
 
-    def submit_graph(self, workflow_id, nodes, *, sinks=None):
+    @classmethod
+    def _normalize_race_after(cls, race_after, node_names):
+        """Validate the optional ``race_after`` mapping for ``submit_graph``.
+
+        Returns ``{node_name: wait}``.  ``None`` and an empty mapping both mean
+        "hedging disabled" and normalize to an empty dict.  Every key must be
+        one of *this* batch's nodes and every wait an integer in 1..3600 that
+        is not a ``bool``.
+        """
+        if race_after is None:
+            return {}
+        if not isinstance(race_after, dict):
+            raise ValueError("race_after must be a dict of node name to wait")
+        normalized = {}
+        for name, wait in race_after.items():
+            _validate_name(name, "race_after node name")
+            if name not in node_names:
+                raise ValueError(
+                    f"race_after names unknown node {name!r}"
+                )
+            if not _is_integer(wait):
+                raise ValueError(
+                    "race_after waits must be integers; booleans are not "
+                    "allowed"
+                )
+            if wait < 1 or wait > MAX_RACE_WAIT:
+                raise ValueError(
+                    f"race_after waits must be between 1 and {MAX_RACE_WAIT}"
+                )
+            normalized[name] = int(wait)
+        return normalized
+
+    def submit_graph(self, workflow_id, nodes, *, sinks=None, race_after=None):
         _validate_name(workflow_id, "workflow ID")
         normalized_nodes = self._validate_graph_nodes(nodes)
         sink_names = _normalize_sinks(sinks)
+        node_names = {node["name"] for node in normalized_nodes}
+        race_waits = self._normalize_race_after(race_after, node_names)
 
         with closing(self._connect()) as db:
             db.execute("BEGIN IMMEDIATE")
@@ -1115,9 +1194,15 @@ class Broker:
                     ids_by_name[node["name"]] = job_id
                     db.execute(
                         "INSERT INTO graph_nodes"
-                        "(job_id, workflow_id, name, status, outcomes) "
-                        "VALUES (?, ?, ?, 'pending', 0)",
-                        (job_id, workflow_id, node["name"]),
+                        "(job_id, workflow_id, name, status, outcomes, "
+                        "race_after, race_hedges) "
+                        "VALUES (?, ?, ?, 'pending', 0, ?, 0)",
+                        (
+                            job_id,
+                            workflow_id,
+                            node["name"],
+                            race_waits.get(node["name"]),
+                        ),
                     )
                     if sink_names:
                         db.executemany(
@@ -1454,6 +1539,7 @@ class Broker:
 
         with closing(self._connect()) as db, db:
             db.execute("BEGIN IMMEDIATE")
+            self._prune_expired_race_leases(db, now)
             row = db.execute(
                 """SELECT j.id, j.payload
                      FROM jobs j
@@ -1461,11 +1547,23 @@ class Broker:
                       AND j.needs_mask = 0
                       AND NOT EXISTS (
                             SELECT 1
+                              FROM graph_nodes gn
+                             WHERE gn.job_id = j.id
+                               AND gn.race_after IS NOT NULL
+                          )
+                      AND NOT EXISTS (
+                            SELECT 1
                               FROM maintenance_ticket_keys mtk
                               JOIN maintenance_tickets mt
                                 ON mt.ticket_id = mtk.ticket_id
                              WHERE mtk.resource_key = j.resource_key
                                AND mt.until > ?
+                          )
+                      AND NOT EXISTS (
+                            SELECT 1
+                              FROM race_leases rl
+                             WHERE rl.resource_key = j.resource_key
+                               AND rl.expires > ?
                           )
                       AND NOT EXISTS (
                             SELECT 1
@@ -1500,7 +1598,7 @@ class Broker:
                           )
                     ORDER BY j.id
                     LIMIT 1""",
-                (now, now),
+                (now, now, now),
             ).fetchone()
             if row is None:
                 return None
@@ -1522,6 +1620,7 @@ class Broker:
 
         with closing(self._connect()) as db, db:
             db.execute("BEGIN IMMEDIATE")
+            self._prune_expired_race_leases(db, now)
             result = self._take_batch_locked(db, now, lease, slots)
         return result
 
@@ -1570,11 +1669,23 @@ class Broker:
                 WHERE j.expires <= ?
                   AND NOT EXISTS (
                         SELECT 1
+                          FROM graph_nodes gn
+                         WHERE gn.job_id = j.id
+                           AND gn.race_after IS NOT NULL
+                      )
+                  AND NOT EXISTS (
+                        SELECT 1
                           FROM maintenance_ticket_keys mtk
                           JOIN maintenance_tickets mt
                             ON mt.ticket_id = mtk.ticket_id
                          WHERE mtk.resource_key = j.resource_key
                            AND mt.until > ?
+                      )
+                  AND NOT EXISTS (
+                        SELECT 1
+                          FROM race_leases rl
+                         WHERE rl.resource_key = j.resource_key
+                           AND rl.expires > ?
                       )
                   AND NOT EXISTS (
                         SELECT 1
@@ -1608,7 +1719,7 @@ class Broker:
                         )
                       )
                 ORDER BY j.id""",
-            (now, now),
+            (now, now, now),
         )
         try:
             while True:
@@ -1682,6 +1793,319 @@ class Broker:
                 receipt=receipt,
             )
         return result
+
+    # ------------------------------------------------------------------
+    # Parallel "hedged" execution for slow graph nodes (race_after)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _validate_pool(pool):
+        _validate_name(pool, "pool")
+
+    @staticmethod
+    def _prune_expired_race_leases(db, now):
+        """Lazily drop execution credentials that are expired at ``now``.
+
+        A credential is effective only while ``expires > now``; ``now ==
+        expires`` is already expired.  Deleting those rows keeps storage
+        proportional to live executions rather than to executed history.
+        """
+        db.execute("DELETE FROM race_leases WHERE expires <= ?", (now,))
+
+    @staticmethod
+    def _race_slot_occupied(db, now):
+        """Whether the single per-database hedge slot is currently taken.
+
+        The slot is taken while any node has two or more effective execution
+        credentials, or while a node that has already reached a conclusion
+        still holds an effective losing credential (the winner committed but
+        another runner has not yet released its resources).
+        """
+        two = db.execute(
+            """SELECT 1 FROM race_leases
+                WHERE expires > ?
+                GROUP BY job_id
+               HAVING COUNT(*) >= 2
+                LIMIT 1""",
+            (now,),
+        ).fetchone()
+        if two is not None:
+            return True
+        terminal = db.execute(
+            """SELECT 1
+                 FROM race_leases rl
+                 JOIN graph_nodes gn ON gn.job_id = rl.job_id
+                WHERE rl.expires > ?
+                  AND gn.status <> 'pending'
+                LIMIT 1""",
+            (now,),
+        ).fetchone()
+        return terminal is not None
+
+    @staticmethod
+    def _dependencies_satisfied(db, job_id):
+        """Whether every original dependency of ``job_id`` is satisfied."""
+        blocking = db.execute(
+            """SELECT 1
+                 FROM graph_dependencies gd
+                 LEFT JOIN graph_nodes gp ON gp.job_id = gd.prerequisite_id
+                WHERE gd.node_id = ?
+                  AND (
+                       (
+                           gd.kind = 'requires'
+                           AND (
+                               gp.job_id IS NULL
+                               OR gp.status <> 'succeeded'
+                           )
+                       )
+                       OR (
+                           gd.kind = 'after'
+                           AND (
+                               gp.job_id IS NULL
+                               OR gp.status = 'pending'
+                           )
+                       )
+                  )
+                LIMIT 1""",
+            (job_id,),
+        ).fetchone()
+        return blocking is None
+
+    def take_race(self, pool, *, capabilities, now, lease):
+        """Lease the smallest-ID hedge-enabled node that can start a round.
+
+        Returns a :class:`Delivery` (original shape) or ``None``.  A node that
+        still holds any effective execution credential is never re-leased
+        here; a fresh round begins only once every credential has expired
+        while the node is still pending.
+        """
+        self._validate_pool(pool)
+        mask = _capability_mask(capabilities)
+        _validate_clock(now, lease)
+
+        with closing(self._connect()) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            self._prune_expired_race_leases(db, now)
+            row = db.execute(
+                """SELECT j.id, j.payload, j.resource_key
+                     FROM jobs j
+                     JOIN graph_nodes gn ON gn.job_id = j.id
+                    WHERE gn.race_after IS NOT NULL
+                      AND gn.status = 'pending'
+                      AND (j.needs_mask & ?) = j.needs_mask
+                      AND NOT EXISTS (
+                            SELECT 1 FROM race_leases rl
+                             WHERE rl.job_id = j.id AND rl.expires > ?
+                          )
+                      AND NOT EXISTS (
+                            SELECT 1
+                              FROM maintenance_ticket_keys mtk
+                              JOIN maintenance_tickets mt
+                                ON mt.ticket_id = mtk.ticket_id
+                             WHERE mtk.resource_key = j.resource_key
+                               AND mt.until > ?
+                          )
+                      AND NOT EXISTS (
+                            SELECT 1
+                              FROM graph_dependencies gd
+                              LEFT JOIN graph_nodes gp
+                                ON gp.job_id = gd.prerequisite_id
+                             WHERE gd.node_id = j.id
+                               AND (
+                                    (
+                                        gd.kind = 'requires'
+                                        AND (
+                                            gp.job_id IS NULL
+                                            OR gp.status <> 'succeeded'
+                                        )
+                                    )
+                                    OR (
+                                        gd.kind = 'after'
+                                        AND (
+                                            gp.job_id IS NULL
+                                            OR gp.status = 'pending'
+                                        )
+                                    )
+                               )
+                          )
+                      AND NOT EXISTS (
+                            SELECT 1 FROM race_leases rl
+                             WHERE rl.resource_key = j.resource_key
+                               AND rl.expires > ?
+                          )
+                      AND (
+                            j.resource_key IS NULL
+                            OR j.id = (
+                                SELECT MIN(k.id)
+                                  FROM jobs k
+                                 WHERE k.resource_key = j.resource_key
+                            )
+                          )
+                    ORDER BY j.id
+                    LIMIT 1""",
+                (mask, now, now, now),
+            ).fetchone()
+            if row is None:
+                return None
+
+            job_id, payload, resource_key = int(row[0]), row[1], row[2]
+            receipt = uuid.uuid4().hex
+            expires = now + lease
+            db.execute(
+                "UPDATE jobs SET receipt = ?, expires = ? WHERE id = ?",
+                (receipt, expires, job_id),
+            )
+            db.execute(
+                "INSERT INTO race_leases"
+                "(job_id, receipt, pool, resource_key, issued, expires) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (job_id, receipt, pool, resource_key, now, expires),
+            )
+            # A fresh round resets the per-round hedge budget.
+            db.execute(
+                "UPDATE graph_nodes SET race_hedges = 0 WHERE job_id = ?",
+                (job_id,),
+            )
+            return Delivery(job_id, payload, receipt)
+
+    def take_hedge(self, job_id, pool, *, capabilities, now, lease):
+        """Issue a second (parallel) execution credential for ``job_id``.
+
+        ``job_id`` must be a positive SQLite signed 64-bit integer.  Returns a
+        :class:`Delivery` with the same task ID and payload but a fresh
+        receipt, or ``None`` when the node does not qualify.
+        """
+        _validate_positive_int64(job_id, "job_id")
+        self._validate_pool(pool)
+        mask = _capability_mask(capabilities)
+        _validate_clock(now, lease)
+
+        with closing(self._connect()) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            self._prune_expired_race_leases(db, now)
+
+            node = db.execute(
+                """SELECT j.payload, j.resource_key, j.needs_mask,
+                          gn.race_after, gn.race_hedges
+                     FROM jobs j
+                     JOIN graph_nodes gn ON gn.job_id = j.id
+                    WHERE j.id = ?
+                      AND gn.race_after IS NOT NULL
+                      AND gn.status = 'pending'""",
+                (job_id,),
+            ).fetchone()
+            if node is None:
+                db.rollback()
+                return None
+            payload, resource_key, needs_mask, wait, hedges = node
+            wait = int(wait)
+            hedges = int(hedges)
+
+            # Exactly one effective credential, and it has waited long enough
+            # since it was issued.
+            current = db.execute(
+                """SELECT pool, issued FROM race_leases
+                    WHERE job_id = ? AND expires > ?
+                    ORDER BY rowid""",
+                (job_id, now),
+            ).fetchall()
+            if len(current) != 1:
+                db.rollback()
+                return None
+            running_pool, issued = current[0]
+            if now < int(issued) + wait:
+                db.rollback()
+                return None
+            if pool == running_pool:
+                db.rollback()
+                return None
+            if (int(needs_mask) & mask) != int(needs_mask):
+                db.rollback()
+                return None
+            if not self._dependencies_satisfied(db, job_id):
+                db.rollback()
+                return None
+            # A maintenance waiting or handed ticket on this key forbids new
+            # hedge executions.
+            paused = db.execute(
+                """SELECT 1
+                     FROM maintenance_ticket_keys mtk
+                     JOIN maintenance_tickets mt
+                       ON mt.ticket_id = mtk.ticket_id
+                    WHERE mtk.resource_key = ?
+                      AND mt.until > ?
+                    LIMIT 1""",
+                (resource_key, now),
+            ).fetchone()
+            if paused is not None:
+                db.rollback()
+                return None
+            # At most two successful hedges per logical round: the initial
+            # take_race plus, after one credential expires, a single re-hedge.
+            if hedges >= MAX_RACE_HEDGES_PER_ROUND:
+                db.rollback()
+                return None
+            # The one database-wide hedge slot must be free.
+            if self._race_slot_occupied(db, now):
+                db.rollback()
+                return None
+
+            receipt = uuid.uuid4().hex
+            expires = now + lease
+            db.execute(
+                "INSERT INTO race_leases"
+                "(job_id, receipt, pool, resource_key, issued, expires) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (job_id, receipt, pool, resource_key, now, expires),
+            )
+            db.execute(
+                "UPDATE graph_nodes SET race_hedges = race_hedges + 1 "
+                "WHERE job_id = ?",
+                (job_id,),
+            )
+            return Delivery(int(job_id), payload, receipt)
+
+    def retire_race(self, delivery, *, now):
+        """Voluntarily return a losing execution credential.
+
+        Returns ``True`` only for an effective, unretired *losing* credential
+        of a node that has already reached its conclusion.  Winning
+        credentials (deleted when the conclusion commits), forged credentials,
+        credentials of a still-pending node, already-returned credentials and
+        expired credentials all return ``False``; none of them changes any
+        conclusion.
+        """
+        if not isinstance(delivery, Delivery):
+            raise ValueError("delivery must be a Delivery")
+        _validate_positive_int64(delivery.id, "delivery.id")
+        if not isinstance(delivery.receipt, str):
+            raise ValueError("delivery.receipt must be a string")
+        _validate_maintenance_receipt(delivery.receipt)
+        _validate_non_negative_int64(now, "now")
+
+        with closing(self._connect()) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            self._prune_expired_race_leases(db, now)
+            job_id = int(delivery.id)
+
+            node = db.execute(
+                "SELECT status, race_after FROM graph_nodes WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            if node is None or node[1] is None:
+                return False
+            # A node that is still awaiting a conclusion has no loser yet.
+            if node[0] == "pending":
+                return False
+            # The winning credential's row was deleted when the conclusion
+            # committed, so any surviving live row is a losing execution.
+            deleted = db.execute(
+                "DELETE FROM race_leases "
+                "WHERE job_id = ? AND receipt = ? AND expires > ?",
+                (job_id, delivery.receipt, now),
+            )
+            return deleted.rowcount == 1
+
 
     def request_maintenance(self, keys, *, now, until):
         """Pause new leases on ``keys`` and open a handoff ticket.
@@ -1779,6 +2203,16 @@ class Broker:
                         (key, now),
                     ).fetchone()
                     if leased is not None:
+                        db.rollback()
+                        return None
+                    # A losing hedged execution keeps occupying its key even
+                    # after the node's jobs row was removed by the winner.
+                    race_held = db.execute(
+                        "SELECT 1 FROM race_leases "
+                        "WHERE resource_key = ? AND expires > ? LIMIT 1",
+                        (key, now),
+                    ).fetchone()
+                    if race_held is not None:
                         db.rollback()
                         return None
                     earlier = db.execute(
@@ -1896,6 +2330,8 @@ class Broker:
     def acknowledge(self, delivery, *, now):
         with closing(self._connect()) as db, db:
             db.execute("BEGIN IMMEDIATE")
+            if self._is_race_node(db, delivery.id):
+                return self._conclude_race(db, delivery, now, "succeeded")
             deleted = db.execute(
                 "DELETE FROM jobs "
                 "WHERE id = ? AND receipt = ? AND expires > ?",
@@ -1916,6 +2352,60 @@ class Broker:
             if updated.rowcount == 1:
                 self._handle_graph_terminal(db, delivery.id, "succeeded")
             return True
+
+    @staticmethod
+    def _is_race_node(db, job_id):
+        row = db.execute(
+            "SELECT race_after FROM graph_nodes WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+        return row is not None and row[0] is not None
+
+    def _conclude_race(self, db, delivery, now, status):
+        """Commit a conclusion for a hedged node using either credential.
+
+        The winning credential's row is removed while any losing credential
+        keeps occupying its resource key and the hedge slot until it retires
+        or expires.  The transaction is the same one that writes dependencies,
+        skip propagation, the terminal status and the outcome stream, so
+        other-key successors are released immediately.
+        """
+        job_id = int(delivery.id)
+        if not isinstance(delivery.receipt, str):
+            return False
+        pending = db.execute(
+            "SELECT 1 FROM graph_nodes "
+            "WHERE job_id = ? AND status = 'pending' AND race_after IS NOT NULL",
+            (job_id,),
+        ).fetchone()
+        if pending is None:
+            return False
+        has_job = db.execute(
+            "SELECT 1 FROM jobs WHERE id = ?", (job_id,)
+        ).fetchone()
+        if has_job is None:
+            return False
+        valid = db.execute(
+            "SELECT 1 FROM race_leases "
+            "WHERE job_id = ? AND receipt = ? AND expires > ?",
+            (job_id, delivery.receipt, now),
+        ).fetchone()
+        if valid is None:
+            return False
+
+        db.execute(
+            "DELETE FROM race_leases WHERE job_id = ? AND receipt = ?",
+            (job_id, delivery.receipt),
+        )
+        db.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
+        db.execute(
+            "UPDATE graph_nodes SET status = ? WHERE job_id = ?",
+            (status, job_id),
+        )
+        if status == "failed":
+            self._skip_requires_descendants(db, job_id)
+        self._handle_graph_terminal(db, job_id, status)
+        return True
 
     _SKIP_REQUIRES_CTE = """
         WITH RECURSIVE skipped(node_id) AS (
@@ -1963,6 +2453,8 @@ class Broker:
 
         with closing(self._connect()) as db, db:
             db.execute("BEGIN IMMEDIATE")
+            if self._is_race_node(db, delivery.id):
+                return self._conclude_race(db, delivery, now, "failed")
             ended = db.execute(
                 """DELETE FROM jobs
                     WHERE id = ?

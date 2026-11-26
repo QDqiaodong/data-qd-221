@@ -27,5 +27,42 @@ with TemporaryDirectory() as root:
     print("end with receipt:", queue.end_maintenance(
         ticket, now=13, receipt=lease["receipt"]
     ))
-    print("after end:", queue.take(now=14, lease=5).payload)
+    after_end = queue.take(now=14, lease=5)
+    print("after end:", after_end.payload)
+    queue.acknowledge(after_end, now=14)
+    queue.acknowledge(queue.take(now=14, lease=5), now=14)
+    # Hedged execution: a slow node runs in pool-a, then pool-b borrows in.
+    nodes = [
+        {
+            "name": "transcode",
+            "key": "video",
+            "payload": "transcode-video",
+            "needs": None,
+            "requires": [],
+            "after": [],
+        },
+        {
+            "name": "publish",
+            "key": "publish-key",
+            "payload": "publish",
+            "needs": None,
+            "requires": ["transcode"],
+            "after": [],
+        },
+    ]
+    ids = queue.submit_graph(
+        "release", nodes, race_after={"transcode": 10}
+    )
+    first = queue.take_race("pool-a", capabilities=frozenset(), now=20, lease=20)
+    print("race start:", first.payload)
+    print("early hedge:", queue.take_hedge(
+        first.id, "pool-b", capabilities=frozenset(), now=24, lease=20
+    ))
+    backup = queue.take_hedge(
+        first.id, "pool-b", capabilities=frozenset(), now=30, lease=20
+    )
+    print("hedged:", backup.id == first.id and backup.receipt != first.receipt)
+    print("backup ack:", queue.acknowledge(backup, now=31))
+    print("publish now ready:", queue.take(now=31, lease=5).id == ids["publish"])
+    print("losing ack:", queue.acknowledge(first, now=31))
 

@@ -2,7 +2,7 @@
 
 应用将任务写入 SQLite；后台 worker 按 FIFO 获取当前可领取的任务，凭当次投递凭据确认。未确认任务到期后可重投，旧 worker 无法用过期凭据删除它。多个 worker / `Broker` 实例可共用同一个数据库文件。
 
-计时由调用方注入，便于确定性验证；所有调用方需使用同一时间基准。`now == expires` 即表示租约到期。当前提供单队列、资源键内保序、能力匹配批量领取和至少一次投递，不承诺消费端恰好一次、延迟重试或死信策略。
+计时由调用方注入，便于确定性验证；所有调用方需使用同一时间基准。`now == expires` 即表示租约到期。当前提供单队列、资源键内保序、能力匹配批量领取、慢节点并行备用执行和至少一次投递，不承诺消费端恰好一次、延迟重试或死信策略。
 
 仅使用 Python 3.9+ 标准库和 SQLite，无外部服务或依赖。
 
@@ -229,6 +229,59 @@ broker.graph_status("release-2026-11")
 
 `pending` 同时表示尚不可领、当前可领和已租约但未结束。非法工作流名抛 `ValueError`；名称合法但未登记抛 `KeyError`。重开数据库后状态和调度资格立即恢复，旧凭据不能改写终态。
 
+## 慢节点备用执行（`race_after`）
+
+有些节点会卡在读盘上。除了原入口等待租约到期换机器，还可以让少数指定节点在等满一段时间后，交给另一个机池并行做一次；两边各用自己的临时文件，Broker 只接受第一个提交的结论。并行执行仍只占一个任务 ID 和原来的一份下游名额，工作流只看到一个节点结论。
+
+### 提交与领取
+
+```python
+ids = broker.submit_graph(
+    "release-2026-13",
+    nodes,
+    race_after={"transcode": 60},            # 仅关键字；None/{} 表示不启用
+)
+
+# 调度器从某个机池领取一个启用的节点（开始一轮执行）：
+first = broker.take_race(
+    "pool-a",                                # 机池名遵循资源键命名规则
+    capabilities=frozenset({"codec"}),       # 类型同批领取单槽；可空，不可 None
+    now=100,
+    lease=30,
+)
+
+# 等满 transcode 的 60 秒后，从另一个机池借一次并行执行：
+backup = broker.take_hedge(
+    first.id, "pool-b",
+    capabilities=frozenset({"codec"}),
+    now=160, lease=30,
+)
+```
+
+- `submit_graph(..., race_after=...)`：可选关键字。它是**本批节点名**到等待时长的字典；`None` 或空字典不启用。每个时长是 1–3,600 的整数（不含 `bool`），名字必须属于本批。非法配置抛 `ValueError`，整次提交不占用工作流名、任务 ID 或接收方容量。启用的节点仍只占一个任务 ID 和原本的一份下游名额；节点与边数量上限不变。
+- `take_race(pool, *, capabilities, now, lease)` 按最小任务 ID 领取符合能力、已满足原依赖、是键内队首且未停发的启用节点，找不到返回 `None`（返回原形状 `Delivery`）。`capabilities` 必须是 `frozenset[str]`（允许 `frozenset()`，不接受 `None`）。**原 `take`、`take_batch` 都不领取启用备用的节点**，也不会绕过同键上尚未结束的备用执行队首；普通任务、未启用的工作流节点和归档转入任务仍用原入口。
+- 一轮执行开始后，同一逻辑节点在**还有任何有效执行凭据**时不能被 `take_race` 重新领取；只有节点仍待结束、所有凭据都已到期，才可开始新一轮（同一任务 ID、新凭据）。
+- `take_hedge(job_id, pool, *, capabilities, now, lease)` 针对已领取的逻辑节点借一次并行执行。要求：恰好一份有效凭据、它已从**自己的发放时刻**等满该节点的时长、请求机池与仍在执行的机池不同、能力满足、该键未被维护停发，且节点仍待结束。成功返回**相同任务 ID、相同 payload、不同凭据**的 `Delivery`，且不延长原凭据；不满足返回 `None`。`job_id` 须为正的 SQLite 有符号 64 位整数（不含 `bool`）。
+- 两个领取入口的时间参数遵守批领取范围；非法参数抛 `ValueError`，不发放凭据、不占名额。时间用同一个不倒拨的租约时钟，`now == expires` 即已失效。
+
+### 备用名额
+
+同一个库只有**一个**备用名额：
+
+- 某节点有两份有效执行凭据时占它；节点已经出结论但仍有有效的**落败**凭据时也占它。
+- 任一执行在结论产生前自然到期、只剩一份有效凭据时，该节点不再占名额。
+- 符合条件且名额空闲时，一轮中的首次借用必须成功。已借过且有一份凭据到期后，可以让幸存者单独跑完、把名额让给其他节点，也可以再借一次恢复冗余（每轮最多成功借两次）。选择恢复冗余时必须真正占住名额，新旧有效凭据都能提交结论。
+- 备用名额的检查、发放与写入在同一个 `BEGIN IMMEDIATE` 事务完成，两个 Broker 不可能各借一次；机池仅用于区分两次执行，不登记跨任务机池配额。
+
+### 结论与资源占用分离
+
+- 对启用备用的节点，`acknowledge` 或 `fail` 都可用**任意一份有效凭据**，先提交的有效结论胜出。`fail` 仍表示节点不可重试的业务失败，不用它报告单台机器变慢。胜出事务照常决定依赖、失败跳过和终态流；工作流状态与接收方只看到一个节点结论，异键下游立即可领，**不必等另一份执行停止**。另一个执行凭据自此不能确认或报告失败。
+- 落败凭据在到期前只表示该执行还没离开资源：它继续占备用名额，阻止同键的普通单领、批领、启用备用节点的领取，也阻止维护独占交接。维护检查会算上“尚未出结论但只有备用执行仍有效”的情况。维护的等待票与已交接票都禁止发出新的备用执行；已有有效执行在维护等待时仍可结束。未归还时，落败凭据在原租约到期时自动不再占用键和名额。
+- 落败者在关闭临时文件、不再操作资源后，可用 `retire_race(delivery, *, now)` 提前归还执行许可：仅对**已出结论节点的有效落败凭据**返回 `True`；胜出的（结论提交时已删除）、伪造的、仍待结束节点的、已归还的或已到期的凭据都返回 `False`，且不改变结论。`now` 用原 `fail` 的时间范围，`delivery` 须是 `Delivery`、`id` 为正 int64、`receipt` 为维护入口接受的非空格式；参数形状非法抛 `ValueError`。允许惰性清理，不保留每次过期或归还执行的永久历史。
+- 结论、落败占用与名额变化和投递、维护在同一个 SQLite 库内一致；不会出现“结果已提交、维护却在执行许可尚未解除时拿到资源”的窗口。重开库不靠 worker 补写状态；旧库直接打开，不改写原凭据、任务顺序或已提交的结论。
+
+Broker 不负责杀进程，也不保证临时文件以外的副作用恰好一次。
+
 ## 结论投递（下游接收方）
 
 索引、清理等下游不必轮询工作流，也不占用 worker 的领取/租约。它们先登记一个带容量的接收方，提交工作流时声明该工作流要把每个节点的结论投递给哪些接收方。
@@ -290,8 +343,9 @@ broker.ack_outcomes("index", through=outcomes[-1]["seq"])  # True
 - `sinks` 必须是元组，元素为已登记名称；`capacity`、`limit`、`through` 的取值规则见上面的结论投递一节。
 - 归档源的 `partitions` 必须是含 1–8 个不同合法名称的元组；归档 `offset` 为正 int64，`event_time`、封存 `through`/`watermark` 为非负 int64，均不能是 `bool`。`publish_ready(limit=...)` 的 `limit` 为 1–128；新 offset 相对当前 through 的超前宽度、以及单次 through 推进宽度均不得超过 12,000。
 - 维护 `keys` 必须是含 1–8 个不同合法资源键的元组；维护时间参数为非负 int64（不含 `bool`），`request_maintenance` 要求 `until > now`；两个票号入口的 `ticket_id` 须为正 int64（不含 `bool`）；receipt 为 `None` 或 1–128 个 `[A-Za-z0-9_-]`。
+- `race_after` 必须是 `dict`（或 `None`），键为本批节点名、值为 1–3,600 的整数（不含 `bool`）。`take_race`/`take_hedge` 的 `pool` 遵循资源键规则；`capabilities` 为 `frozenset[str]`（不可 `None`），`job_id`/`Delivery.id` 为正 int64（不含 `bool`），时间参数遵守批领取范围，`retire_race` 的 `now` 遵守原 `fail` 范围。
 
-现有数据库可直接由新版 `Broker(path)` 打开。初始化会在事务内补齐 `resource_key`、`needs_mask` 列，并额外创建 `graph_workflows`、`graph_nodes`、`graph_dependencies` 表；若旧表的 `payload TEXT NOT NULL` 阻碍空 payload，会重建 `jobs` 表并原样复制 ID、payload、receipt、expires，同时保留 AUTOINCREMENT 序列高水位和早期库中的非整数到期值。归档源功能额外幂等创建 `archive_feed_sources`、`archive_events` 及就绪顺序部分索引，不改变或迁移任何旧任务。结论投递相关表（`sink_registry`、`sink_watermark`、`graph_node_sinks`、`outcome_stream`、`outcome_deliveries`）以 `IF NOT EXISTS` 补齐；旧版 `graph_nodes` 会新增 `outcomes` 列并以 `DEFAULT 1` 标记既有节点，因此升级不会补发旧终态结论、也不改写活跃租约。维护交接相关表（`maintenance_tickets`、`maintenance_ticket_keys`、`maintenance_meta`）及按键索引同样以 `IF NOT EXISTS` 补齐，不改写任何旧任务、凭据、终态或归档进度。不需要清空或另建队列。
+现有数据库可直接由新版 `Broker(path)` 打开。初始化会在事务内补齐 `resource_key`、`needs_mask` 列，并额外创建 `graph_workflows`、`graph_nodes`、`graph_dependencies` 表；若旧表的 `payload TEXT NOT NULL` 阻碍空 payload，会重建 `jobs` 表并原样复制 ID、payload、receipt、expires，同时保留 AUTOINCREMENT 序列高水位和早期库中的非整数到期值。归档源功能额外幂等创建 `archive_feed_sources`、`archive_events` 及就绪顺序部分索引，不改变或迁移任何旧任务。结论投递相关表（`sink_registry`、`sink_watermark`、`graph_node_sinks`、`outcome_stream`、`outcome_deliveries`）以 `IF NOT EXISTS` 补齐；旧版 `graph_nodes` 会新增 `outcomes` 列并以 `DEFAULT 1` 标记既有节点，因此升级不会补发旧终态结论、也不改写活跃租约。维护交接相关表（`maintenance_tickets`、`maintenance_ticket_keys`、`maintenance_meta`）及按键索引同样以 `IF NOT EXISTS` 补齐，不改写任何旧任务、凭据、终态或归档进度。备用执行对旧版 `graph_nodes` 增补 `race_after`（默认 `NULL`，即不启用）与 `race_hedges`（默认 0）两列，并以 `IF NOT EXISTS` 创建 `race_leases` 表及按键/按任务/按到期索引；旧节点与既有调度行为不受影响。不需要清空或另建队列。
 
 ## 本地测试与演示
 
@@ -330,5 +384,8 @@ python3 -B demo.py
 - 两个独立实例并发交接同一票恰有一个成功；worker 与维护在同一键竞争时序列化（worker 先赢则原凭据不变、维护须等收尾；维护先封则 worker 不得领取）；
 - 停发时同键旧工作流凭据仍可 ack/fail 并产生正确终态与结论，同键后继与归档转入须等维护结束后按原次序/能力投递；
 - 11,999 张无关键等待票 + 一张目标票达到 12,000 上限，另配 12,000 条无关键任务和一条目标键旧投递；两次交接（到期前 `None`、恰到期成功）各自每 1,000 条 VM 指令的 progress handler 回调不超过 20 次；到期/结束的票不永久占用容量。
+- 备用执行：`race_after` 校验与无副作用、`take`/`take_batch` 不领启用节点、`take_race` 的能力/依赖/键内顺序/停发规则；备用执行先胜出后异键立即可领而同键仍不可领、重开库旧执行不能再报结论、同库单一备用名额、落败凭据阻止三类领取与维护、`retire_race` 归还后名额与键释放、维护归还后同键后继可领；
+- 备用执行轮次边界：首份恰好到期而备用仍有效时不能被普通入口重开，幸存者单独跑完可让名额、或再借一次恢复冗余（旧凭据失效、新旧凭据均可提交、另一节点暂借不到名额），维护等待禁止新备用而旧执行仍可结束，全部凭据到期而节点仍待结束时可用同一任务 ID 开新一轮；
+- 两个独立实例并发为不同节点争最后一个名额恰有一个成功；胜出节点的两份有效凭据并发成功/失败恰有一个结论生效，并按真实胜负核对 `requires`/`after` 放行与接收方终态，用旧入口实际领取后续；
 
 演示依次显示任务领取、重投、`stale ack: False`、`current ack: True`、`empty: True`，以及维护交接的停发、独占、归还。
