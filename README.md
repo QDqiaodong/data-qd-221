@@ -102,6 +102,52 @@ published = broker.publish_ready(limit=64)
 
 就绪选择使用 `sealed = 1` 部分索引 `(event_time, partition, source_offset)`，并用 `LIMIT` 提前终止；查询不会为了找到极短的就绪前缀而扫描、排序或装载整个未来积压，payload 也只读取本批中签的行。
 
+## 维护交接（跨资源独占）
+
+运维有时要同时替换某素材的原件与代理文件所在的多个资源。仅等队列空再操作不可靠：队列一直会有新任务，其他 `Broker` 实例也可能在检查后立刻发出投递。维护交接协议把这件事拆成**两个明确时点**：
+
+1. **停发（pause）**：调用 `request_maintenance` 提交一张等待票起，票上列出的每个资源键就立即禁止发出**新投递**；带键的普通任务、工作流节点、归档转入的任务都受影响，键为空的历史任务不受影响。此时尚未获得独占，已开工的 worker 继续收尾。
+2. **独占（handoff）**：调用 `take_maintenance` 在该组键上没有有效 worker 投递、且没有更早的有效票挡路时，把整组键一次性交给这张票，返回一次性 `receipt`。此后到截止时刻前，该组键不再产生任何新投递。
+
+停发与独占是两个独立时点：**申请成功不等于已经独占**，其间 worker 仍可能完成或到期。调用方应在需要真正排他操作时才尝试 `take_maintenance`，拿到 `receipt` 后立即开始维护，并务必在 `until` 之前完成——Broker 只管理许可，不强制中断外部进程；维护者和 worker 都必须在各自许可到期前停止外部操作。
+
+```python
+ticket = broker.request_maintenance(
+    ("asset-a", "asset-b"),     # 1–8 个不同资源键，顺序无业务含义
+    now=100,
+    until=160,                  # until > now；整张票共用的截止时刻
+)
+
+# 稍后（等已开工 worker 收尾后）尝试独占：
+lease = broker.take_maintenance(ticket, now=105)
+if lease is None:
+    ...                          # 仍有有效 worker 投递 / 更早的票未让路 / 已过期
+
+assert lease["ticket_id"] == ticket
+assert lease["until"] == 160     # 截止时刻不因领取而延长
+
+# 维护结束，凭本次 receipt 归还（None 只能取消尚未交接的等待票）：
+broker.end_maintenance(ticket, now=150, receipt=lease["receipt"])
+```
+
+### 停发与交接语义
+
+- `keys` 必须是含 1–8 个**互不相同**资源键的元组，键名规则同 `put_ordered`（1–64 个 `[A-Za-z0-9_-]`，区分大小写）。顺序无业务含义；重复提交相同资源是不同申请，各自得到不同票号。
+- `request_maintenance` 返回本库内从 1 起连续分配、**不复用**的正整数票号；票号与任务 ID 无关。达到 12,000 张仍有效票（等待 + 已交接）时抛 `BufferError`，不占票号；已结束或到期的票不占容量，历史记录会惰性回收，反复申请/结束/到期不会永久增长。
+- 从申请提交起，只要票尚未结束且 `now < until`，它列出的**每个键**都禁止新投递，等待票与已交接票同样有效。这与 `take`、`take_batch` 都适用，同时挡住首次领取和到期重投。停发任务在原有队首、依赖、能力与批分配规则之前先被排除，不会先占槽再丢弃结果。**已发出的 worker 凭据不撤销**，仍可照常 `acknowledge`/`fail`，包括原有跳过、依赖放行和终态结论交付；写入与归档转入照常，新产生的可执行任务也要等自己的键解禁。
+- `take_maintenance(ticket_id, *, now)` 仅在该票**仍在等待**、其**每个键都没有当前有效 worker 投递**（对 worker 需 `expires > now`）、且**每个键上都没有更早而仍有效的票**（对维护票需 `until > now`）时成功。更早的票即使卡在别的键、自己也还没独占，只要与之相交就保有先位；不能只看已交接的票。整组键要么全部交给这张票，要么一个也不给。
+- 成功返回 `{"ticket_id", "receipt", "until"}`，`until` 是原截止时刻。同一票最多成功交接一次：同票重试、无此票、已结束、已到期或暂不满足条件均返回 `None`，不补发凭据。**若成功响应丢失，应等原截止时刻再处理，不能把票号本身当作许可。**
+- `end_maintenance(ticket_id, *, now, receipt=None)`：有效的等待票可用 `None` 取消；有效的已交接票只能凭该次返回的 receipt 归还。成功返回 `True` 并解除该票对全部键的占用，但保留其他票对这些键的限制。错误、过期或重复的凭据、错误阶段或无此票返回 `False`。receipt 的非空合法形式是 1–128 个 `[A-Za-z0-9_-]`；它是进程间的交接凭据，不是用户鉴权体系。
+- 到 `now == until` 时即使没人归还，票也不再限制任一键。
+
+### 参数与并发
+
+- 所有维护接口的时间都是非负的 SQLite 有符号 64 位整数，不接受 `bool`；`request_maintenance` 额外要求 `until > now`。
+- 两个票号入口对非正数、超出 SQLite 有符号 64 位范围或非整数（含 `bool`）的票号抛 `ValueError`；非法 `keys`、时间、receipt 也抛 `ValueError`，不留下半张票、不改变原状态。
+- 停发判断、许可判断与对应状态/投递写入都在同一个 `BEGIN IMMEDIATE` 事务内完成。两个独立实例竞争同一票的交接时恰有一个成功；worker 与维护在同一键上竞争时，要么 worker 先赢（维护须等它收尾或到期），要么维护先封住该键（worker 不得同时领取），不会一边授权一边放行。
+- 只涉及的少数键的交接用按 `(resource_key, ticket_id)`、`(resource_key, expires)` 建立的索引定位，不扫描无关积压、不争用全表写窗口。
+- 同一个库重开后保留已生效的停发、交接和凭据；旧库可直接打开，不迁移或改写原有任务、活跃凭据、任务 ID、终态或归档进度。
+
 ## 工作流依赖图
 
 使用 `submit_graph(workflow_id, nodes)` 在同一个 SQLite 事务内提交整组节点。`workflow_id`、节点 `name` 和节点 `key` 都使用上述 1–64 字符命名规则；同一工作流内节点名不能重复，工作流名一旦使用便不能再次提交（即使所有节点都已结束）。
@@ -243,8 +289,9 @@ broker.ack_outcomes("index", through=outcomes[-1]["seq"])  # True
 - `now`、`lease` 必须是整数且不能是 `bool`；`now >= 0`、`lease > 0`、`now + lease <= 2**63 - 1`。
 - `sinks` 必须是元组，元素为已登记名称；`capacity`、`limit`、`through` 的取值规则见上面的结论投递一节。
 - 归档源的 `partitions` 必须是含 1–8 个不同合法名称的元组；归档 `offset` 为正 int64，`event_time`、封存 `through`/`watermark` 为非负 int64，均不能是 `bool`。`publish_ready(limit=...)` 的 `limit` 为 1–128；新 offset 相对当前 through 的超前宽度、以及单次 through 推进宽度均不得超过 12,000。
+- 维护 `keys` 必须是含 1–8 个不同合法资源键的元组；维护时间参数为非负 int64（不含 `bool`），`request_maintenance` 要求 `until > now`；两个票号入口的 `ticket_id` 须为正 int64（不含 `bool`）；receipt 为 `None` 或 1–128 个 `[A-Za-z0-9_-]`。
 
-现有数据库可直接由新版 `Broker(path)` 打开。初始化会在事务内补齐 `resource_key`、`needs_mask` 列，并额外创建 `graph_workflows`、`graph_nodes`、`graph_dependencies` 表；若旧表的 `payload TEXT NOT NULL` 阻碍空 payload，会重建 `jobs` 表并原样复制 ID、payload、receipt、expires，同时保留 AUTOINCREMENT 序列高水位和早期库中的非整数到期值。归档源功能额外幂等创建 `archive_feed_sources`、`archive_events` 及就绪顺序部分索引，不改变或迁移任何旧任务。结论投递相关表（`sink_registry`、`sink_watermark`、`graph_node_sinks`、`outcome_stream`、`outcome_deliveries`）以 `IF NOT EXISTS` 补齐；旧版 `graph_nodes` 会新增 `outcomes` 列并以 `DEFAULT 1` 标记既有节点，因此升级不会补发旧终态结论、也不改写活跃租约。不需要清空或另建队列。
+现有数据库可直接由新版 `Broker(path)` 打开。初始化会在事务内补齐 `resource_key`、`needs_mask` 列，并额外创建 `graph_workflows`、`graph_nodes`、`graph_dependencies` 表；若旧表的 `payload TEXT NOT NULL` 阻碍空 payload，会重建 `jobs` 表并原样复制 ID、payload、receipt、expires，同时保留 AUTOINCREMENT 序列高水位和早期库中的非整数到期值。归档源功能额外幂等创建 `archive_feed_sources`、`archive_events` 及就绪顺序部分索引，不改变或迁移任何旧任务。结论投递相关表（`sink_registry`、`sink_watermark`、`graph_node_sinks`、`outcome_stream`、`outcome_deliveries`）以 `IF NOT EXISTS` 补齐；旧版 `graph_nodes` 会新增 `outcomes` 列并以 `DEFAULT 1` 标记既有节点，因此升级不会补发旧终态结论、也不改写活跃租约。维护交接相关表（`maintenance_tickets`、`maintenance_ticket_keys`、`maintenance_meta`）及按键索引同样以 `IF NOT EXISTS` 补齐，不改写任何旧任务、凭据、终态或归档进度。不需要清空或另建队列。
 
 ## 本地测试与演示
 
@@ -278,5 +325,10 @@ python3 -B demo.py
 - 两个独立 `Broker` 实例并发发布时无重复、无遗漏且 job ID/全局顺序一致；
 - 归档任务沿用资源键 FIFO、GPU 能力阻塞、旧凭据/到期重领，并与同键工作流和 sink 结论共存；
 - 8 分区、84,000 条积压（含 1,024 条 16 KiB payload）下，重开后三次 `limit=1` 发布只命中时刻 0、时刻 10 和空列表；每次调用的 `tracemalloc` 峰值增量不超过 6 MiB，每 1,000 条 VM 指令采样的 progress handler 回调不超过 150 次。
+- 维护交接单库时间线：键 x 的旧 worker 凭据到 15 才失效时，A(x,y)、B(y,z)、C(z)、D(u) 的停发/交接顺序，B 与 C 不能借空闲键抢先、D 独立交接；重开库保留停发与凭据，15 时 A 可交接、旧凭据失效；无凭据/错凭据归还被拒，凭正确 receipt 结束后 x 可重投而 y 仍停发，20 时 B 不可归还、C 可交接且 y 可投递；
+- 等待票取消释放下一张票的先位、自然到期解除最后一张票的停发；混有有效键的非法申请不留下任何停发；
+- 两个独立实例并发交接同一票恰有一个成功；worker 与维护在同一键竞争时序列化（worker 先赢则原凭据不变、维护须等收尾；维护先封则 worker 不得领取）；
+- 停发时同键旧工作流凭据仍可 ack/fail 并产生正确终态与结论，同键后继与归档转入须等维护结束后按原次序/能力投递；
+- 11,999 张无关键等待票 + 一张目标票达到 12,000 上限，另配 12,000 条无关键任务和一条目标键旧投递；两次交接（到期前 `None`、恰到期成功）各自每 1,000 条 VM 指令的 progress handler 回调不超过 20 次；到期/结束的票不永久占用容量。
 
-演示依次显示任务领取、重投、`stale ack: False`、`current ack: True` 和 `empty: True`。
+演示依次显示任务领取、重投、`stale ack: False`、`current ack: True`、`empty: True`，以及维护交接的停发、独占、归还。

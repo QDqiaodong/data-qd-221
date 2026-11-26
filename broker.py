@@ -19,6 +19,7 @@ __all__ = ["Broker", "Delivery"]
 
 
 _NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
+_RECEIPT_RE = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 _PAYLOAD_LIMIT = 16 * 1024
 _MAX_SQLITE_INTEGER = (1 << 63) - 1
 MAX_WORKERS = 24
@@ -30,6 +31,8 @@ MAX_OUTCOME_LIMIT = 128
 MAX_FEED_PARTITIONS = 8
 MAX_FEED_PENDING = 12_000
 MAX_PUBLISH_LIMIT = 128
+MAX_MAINTENANCE_TICKETS = 12_000
+MAX_MAINTENANCE_KEYS = 8
 
 CAPABILITIES = (
     "gpu",
@@ -153,6 +156,51 @@ def _validate_non_negative_int64(value, kind):
     return value
 
 
+def _validate_ticket_id(value):
+    if not _is_integer(value) or value < 1 or value > _MAX_SQLITE_INTEGER:
+        raise ValueError(
+            "ticket_id must be a positive SQLite signed 64-bit integer; "
+            "booleans are not allowed"
+        )
+    return value
+
+
+def _normalize_maintenance_keys(keys):
+    """Validate a maintenance ticket's resource keys as an ordered tuple."""
+    if not isinstance(keys, tuple):
+        raise ValueError("keys must be a tuple of 1 to 8 resource keys")
+    if not 1 <= len(keys) <= MAX_MAINTENANCE_KEYS:
+        raise ValueError(
+            f"keys must contain 1 to {MAX_MAINTENANCE_KEYS} resource keys"
+        )
+    seen = set()
+    for key in keys:
+        _validate_name(key, "resource key")
+        if key in seen:
+            raise ValueError(f"keys contains duplicate resource key {key!r}")
+        seen.add(key)
+    return tuple(keys)
+
+
+def _validate_maintenance_receipt(receipt):
+    if receipt is None:
+        return None
+    if not isinstance(receipt, str) or _RECEIPT_RE.fullmatch(receipt) is None:
+        raise ValueError(
+            "receipt must be 1-128 ASCII letters, digits, underscores, or "
+            "hyphens"
+        )
+    return receipt
+
+
+def _validate_maintenance_window(now, until):
+    _validate_non_negative_int64(now, "now")
+    _validate_non_negative_int64(until, "until")
+    if until <= now:
+        raise ValueError("until must be strictly greater than now")
+    return now, until
+
+
 def _normalize_sinks(sinks):
     """Return a de-duplicated tuple of registered sink names.
 
@@ -222,10 +270,15 @@ class Broker:
                 "CREATE INDEX IF NOT EXISTS idx_jobs_resource_key_id "
                 "ON jobs(resource_key, id)"
             )
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_jobs_resource_key_expires "
+                "ON jobs(resource_key, expires)"
+            )
             self._create_graph_schema(db)
             self._migrate_graph_nodes(db)
             self._create_sink_schema(db)
             self._create_feed_schema(db)
+            self._create_maintenance_schema(db)
             db.commit()
 
     @staticmethod
@@ -371,6 +424,71 @@ class Broker:
                     event_time, partition, source_offset
                 )
                 WHERE sealed = 1"""
+        )
+
+    @staticmethod
+    def _create_maintenance_schema(db):
+        # ``state`` values:
+        #   'waiting'   - queued for handoff; blocks new leases on its keys
+        #   'handed'    - currently holds the exclusive lease on its keys
+        # A ticket whose ``until <= now`` is naturally dead and no longer
+        # blocks anything; such rows may be reclaimed lazily.
+        #
+        # ``ticket_keys`` is the association table used for per-key lookups.
+        # A ticket's earliest live ticket on a shared key holds precedence; the
+        # unique (resource_key) is intentionally NOT declared because waiting
+        # tickets may freely share keys.
+        db.execute(
+            """CREATE TABLE IF NOT EXISTS maintenance_tickets (
+                ticket_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                state TEXT NOT NULL
+                    CHECK (state IN ('waiting', 'handed')),
+                receipt TEXT,
+                requested_at INTEGER NOT NULL,
+                until INTEGER NOT NULL
+            )"""
+        )
+        db.execute(
+            """CREATE TABLE IF NOT EXISTS maintenance_ticket_keys (
+                ticket_id INTEGER NOT NULL,
+                resource_key TEXT NOT NULL,
+                PRIMARY KEY (ticket_id, resource_key)
+            )"""
+        )
+        # Lookup by key is the hot path for both take()/take_batch() (is this
+        # key paused?) and take_maintenance() (is there an earlier live ticket
+        # on this key?).  The index lets both seek one key instead of scanning
+        # unrelated tickets.
+        db.execute(
+            """CREATE INDEX IF NOT EXISTS idx_maint_keys_key_ticket
+                ON maintenance_ticket_keys(resource_key, ticket_id)"""
+        )
+        # Expired tickets are pruned lazily via a range scan on ``until``; an
+        # empty range (everything still live) costs nothing.
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_maint_tickets_until "
+            "ON maintenance_tickets(until)"
+        )
+        # A single-row counter of stored (i.e. live) tickets keeps the admission
+        # check O(1) even with 12,000 rows.  Expired rows are pruned on each
+        # request and subtracted here, so the counter tracks live capacity.
+        db.execute(
+            """CREATE TABLE IF NOT EXISTS maintenance_meta (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                live_count INTEGER NOT NULL DEFAULT 0
+                    CHECK (live_count >= 0)
+            )"""
+        )
+        db.execute(
+            "INSERT OR IGNORE INTO maintenance_meta(id, live_count) VALUES (1, 0)"
+        )
+        # Reconcile the counter with the stored rows so a database opened by an
+        # older/newer build (or by hand) cannot inherit a drifted count.  The
+        # invariant is: live_count == COUNT(*) of maintenance_tickets.  Expired
+        # rows still stored count here; the next request/end prunes them.
+        db.execute(
+            "UPDATE maintenance_meta SET live_count = "
+            "(SELECT COUNT(*) FROM maintenance_tickets) WHERE id = 1"
         )
 
     @staticmethod
@@ -1343,6 +1461,14 @@ class Broker:
                       AND j.needs_mask = 0
                       AND NOT EXISTS (
                             SELECT 1
+                              FROM maintenance_ticket_keys mtk
+                              JOIN maintenance_tickets mt
+                                ON mt.ticket_id = mtk.ticket_id
+                             WHERE mtk.resource_key = j.resource_key
+                               AND mt.until > ?
+                          )
+                      AND NOT EXISTS (
+                            SELECT 1
                               FROM graph_dependencies gd
                               LEFT JOIN graph_nodes gp
                                 ON gp.job_id = gd.prerequisite_id
@@ -1374,7 +1500,7 @@ class Broker:
                           )
                     ORDER BY j.id
                     LIMIT 1""",
-                (now,),
+                (now, now),
             ).fetchone()
             if row is None:
                 return None
@@ -1444,6 +1570,14 @@ class Broker:
                 WHERE j.expires <= ?
                   AND NOT EXISTS (
                         SELECT 1
+                          FROM maintenance_ticket_keys mtk
+                          JOIN maintenance_tickets mt
+                            ON mt.ticket_id = mtk.ticket_id
+                         WHERE mtk.resource_key = j.resource_key
+                           AND mt.until > ?
+                      )
+                  AND NOT EXISTS (
+                        SELECT 1
                           FROM graph_dependencies gd
                           LEFT JOIN graph_nodes gp
                             ON gp.job_id = gd.prerequisite_id
@@ -1474,7 +1608,7 @@ class Broker:
                         )
                       )
                 ORDER BY j.id""",
-            (now,),
+            (now, now),
         )
         try:
             while True:
@@ -1548,6 +1682,216 @@ class Broker:
                 receipt=receipt,
             )
         return result
+
+    def request_maintenance(self, keys, *, now, until):
+        """Pause new leases on ``keys`` and open a handoff ticket.
+
+        Returns a per-database ticket number starting at 1 and never reused.
+        The ticket blocks new deliveries on every listed key from the moment it
+        is committed until it ends or ``until <= now``.  It does not cancel
+        unfinished work; already-issued worker credentials remain usable.
+        """
+        normalized = _normalize_maintenance_keys(keys)
+        _validate_maintenance_window(now, until)
+
+        with closing(self._connect()) as db:
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                self._prune_expired_tickets(db, now)
+                live = db.execute(
+                    "SELECT live_count FROM maintenance_meta WHERE id = 1"
+                ).fetchone()[0]
+                if int(live) >= MAX_MAINTENANCE_TICKETS:
+                    raise BufferError(
+                        "at most "
+                        f"{MAX_MAINTENANCE_TICKETS} live maintenance tickets "
+                        "are allowed"
+                    )
+                ticket_id = db.execute(
+                    "INSERT INTO maintenance_tickets"
+                    "(state, receipt, requested_at, until) "
+                    "VALUES ('waiting', NULL, ?, ?)",
+                    (now, until),
+                ).lastrowid
+                ticket_id = int(ticket_id)
+                db.executemany(
+                    "INSERT INTO maintenance_ticket_keys"
+                    "(ticket_id, resource_key) VALUES (?, ?)",
+                    [(ticket_id, key) for key in normalized],
+                )
+                db.execute(
+                    "UPDATE maintenance_meta SET live_count = live_count + 1 "
+                    "WHERE id = 1"
+                )
+                db.commit()
+            except BaseException:
+                db.rollback()
+                raise
+        return ticket_id
+
+    def take_maintenance(self, ticket_id, *, now):
+        """Attempt to hand ``ticket_id`` the exclusive lease on all its keys.
+
+        Succeeds only when the ticket is still waiting, no listed key has a
+        valid worker lease (``expires > now``), and no earlier live ticket
+        shares any listed key.  Returns ``{"ticket_id", "receipt", "until"}`` or
+        ``None``.  A ticket can be handed over at most once; a lost response is
+        not recovered by retrying — wait for ``until`` instead.
+        """
+        _validate_ticket_id(ticket_id)
+        _validate_non_negative_int64(now, "now")
+
+        with closing(self._connect()) as db:
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                # No global pruning here: a handoff concerns only its own keys,
+                # so it must not scan or delete unrelated ticket rows.  Expired
+                # tickets are ignored by the ``until > now`` predicates below
+                # and reclaimed lazily by request/end.
+                row = db.execute(
+                    "SELECT state, until FROM maintenance_tickets "
+                    "WHERE ticket_id = ? AND until > ?",
+                    (ticket_id, now),
+                ).fetchone()
+                if row is None:
+                    db.rollback()
+                    return None
+                state, until = row
+                if state == "handed":
+                    db.rollback()
+                    return None
+
+                keys = [
+                    key
+                    for (key,) in db.execute(
+                        "SELECT resource_key FROM maintenance_ticket_keys "
+                        "WHERE ticket_id = ? ORDER BY resource_key",
+                        (ticket_id,),
+                    )
+                ]
+
+                for key in keys:
+                    # ``expires > now`` is an effective worker credential, which
+                    # must finish (or expire) before the group is handed over.
+                    leased = db.execute(
+                        "SELECT 1 FROM jobs "
+                        "WHERE resource_key = ? AND expires > ? LIMIT 1",
+                        (key, now),
+                    ).fetchone()
+                    if leased is not None:
+                        db.rollback()
+                        return None
+                    earlier = db.execute(
+                        """SELECT 1
+                             FROM maintenance_ticket_keys mtk
+                             JOIN maintenance_tickets mt
+                               ON mt.ticket_id = mtk.ticket_id
+                            WHERE mtk.resource_key = ?
+                              AND mt.ticket_id < ?
+                              AND mt.until > ?
+                            LIMIT 1""",
+                        (key, ticket_id, now),
+                    ).fetchone()
+                    if earlier is not None:
+                        db.rollback()
+                        return None
+
+                receipt = uuid.uuid4().hex
+                db.execute(
+                    "UPDATE maintenance_tickets "
+                    "SET state = 'handed', receipt = ? "
+                    "WHERE ticket_id = ? AND state = 'waiting'",
+                    (receipt, ticket_id),
+                )
+                db.commit()
+            except BaseException:
+                db.rollback()
+                raise
+        return {
+            "ticket_id": ticket_id,
+            "receipt": receipt,
+            "until": int(until),
+        }
+
+    def end_maintenance(self, ticket_id, *, now, receipt=None):
+        """Cancel a waiting ticket (``receipt=None``) or return a handed one.
+
+        Returns ``True`` when a live ticket was ended, releasing its keys while
+        leaving every other ticket's restrictions in place.  Expired, ended or
+        unknown tickets, wrong receipts, and the wrong phase all return
+        ``False``.
+        """
+        _validate_ticket_id(ticket_id)
+        _validate_non_negative_int64(now, "now")
+        receipt = _validate_maintenance_receipt(receipt)
+
+        with closing(self._connect()) as db:
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                self._prune_expired_tickets(db, now)
+                row = db.execute(
+                    "SELECT state, receipt FROM maintenance_tickets "
+                    "WHERE ticket_id = ? AND until > ?",
+                    (ticket_id, now),
+                ).fetchone()
+                if row is None:
+                    db.rollback()
+                    return False
+                state, stored_receipt = row
+
+                if state == "waiting":
+                    if receipt is not None:
+                        db.rollback()
+                        return False
+                else:  # handed
+                    if receipt is None or receipt != stored_receipt:
+                        db.rollback()
+                        return False
+
+                db.execute(
+                    "DELETE FROM maintenance_ticket_keys WHERE ticket_id = ?",
+                    (ticket_id,),
+                )
+                db.execute(
+                    "DELETE FROM maintenance_tickets WHERE ticket_id = ?",
+                    (ticket_id,),
+                )
+                db.execute(
+                    "UPDATE maintenance_meta "
+                    "SET live_count = MAX(0, live_count - 1) WHERE id = 1"
+                )
+                db.commit()
+            except BaseException:
+                db.rollback()
+                raise
+        return True
+
+    @staticmethod
+    def _prune_expired_tickets(db, now):
+        """Delete tickets that no longer block anything at ``now``.
+
+        Uses the ``until`` index, so a database full of live tickets costs a
+        single empty range probe.  Capacity counts only stored (live) rows.
+        """
+        expired = db.execute(
+            "SELECT ticket_id FROM maintenance_tickets WHERE until <= ?",
+            (now,),
+        ).fetchall()
+        if not expired:
+            return 0
+        ids = [(int(row[0]),) for row in expired]
+        db.executemany(
+            "DELETE FROM maintenance_ticket_keys WHERE ticket_id = ?", ids
+        )
+        db.executemany(
+            "DELETE FROM maintenance_tickets WHERE ticket_id = ?", ids
+        )
+        db.execute(
+            "UPDATE maintenance_meta SET live_count = MAX(0, live_count - ?) "
+            "WHERE id = 1",
+            (len(ids),),
+        )
+        return len(ids)
 
     def acknowledge(self, delivery, *, now):
         with closing(self._connect()) as db, db:
